@@ -1,0 +1,28 @@
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Java / Maven
+backend/target/
+*.class
+*.jar
+*.war
+
+# Python
+agent/__pycache__/
+*.py[cod]
+*.pyo
+agent/.env
+
+# Node / Vue
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
