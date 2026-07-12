@@ -7,6 +7,11 @@ const messages = ref([
 ]);
 const inputMessage = ref('');
 const isLoading = ref(false);
+const isLoadingMore = ref(false);
+const hasMore = ref(true);
+const pageNum = ref(1);
+const pageSize = ref(20);
+const chatContainer = ref(null);
 const sessions = ref([]);
 const currentSessionId = ref(null);
 const sidebarOpen = ref(true);
@@ -65,30 +70,63 @@ const createNewSession = async () => {
  console.error('创建会话失败:', error);
  }
 };
-const selectSession = async (session) => {
- currentSessionId.value = session.id;
+const loadMessages = async (page = 1) => {
+ if (!currentSessionId.value || isLoadingMore.value) return;
+ 
+ isLoadingMore.value = true;
+ 
  try {
  const token = localStorage.getItem('token');
- const response = await fetch(`/api/session/messages?sessionId=${session.id}`, {
+ const response = await fetch(`/api/session/messages/page?sessionId=${currentSessionId.value}&pageNum=${page}&pageSize=${pageSize.value}`, {
  headers: {
  'Authorization': token || ''
  }
  });
+ 
+ if (response.status === 401) {
+ localStorage.removeItem('token');
+ localStorage.removeItem('username');
+ router.push('/');
+ return;
+ }
+ 
  const data = await response.json();
- if (data.code === 200) {
- const msgs = data.data.messages;
- if (msgs && msgs.length > 0) {
- messages.value = msgs.map(msg => ({
+ 
+ if (data.code === 200 && data.data) {
+ const newMessages = data.data.messages || [];
+ 
+ const formattedMessages = newMessages.map(msg => ({
  type: msg.role === 'user' ? 'user' : 'bot',
  content: msg.content
  }));
+ 
+ if (page === 1) {
+ messages.value = [...formattedMessages.reverse()];
+ } else {
+ messages.value = [...formattedMessages.reverse(), ...messages.value];
  }
- else {
- messages.value = [{ type: 'system', content: '欢迎使用小爱，发送消息开始聊天' }];
- }
+ 
+ hasMore.value = data.data.hasNext || false;
+ pageNum.value = page;
  }
  } catch (error) {
- console.error('加载会话消息失败:', error);
+ console.error('加载消息失败:', error);
+ } finally {
+ isLoadingMore.value = false;
+ }
+};
+const selectSession = async (session) => {
+ currentSessionId.value = session.id;
+ pageNum.value = 1;
+ hasMore.value = true;
+ await loadMessages(1);
+};
+const handleScroll = async () => {
+ const container = chatContainer.value;
+ if (!container || isLoadingMore.value) return;
+ 
+ if (container.scrollTop < 50 && hasMore.value) {
+ await loadMessages(pageNum.value + 1);
  }
 };
 const handleLogout = () => {
@@ -193,7 +231,10 @@ const sendMessage = async () => {
       </aside>
       
       <div class="chat-content">
-        <div class="chat-messages">
+        <div v-if="isLoadingMore && messages.length > 1" class="loading-more">
+          加载中...
+        </div>
+        <div class="chat-messages" ref="chatContainer" @scroll="handleScroll">
           <div 
             v-for="(msg, index) in messages" 
             :key="index"
@@ -393,6 +434,13 @@ const sendMessage = async () => {
   display: flex;
   flex-direction: column;
   background-color: #f5f7fa;
+}
+
+.loading-more {
+  text-align: center;
+  padding: 10px;
+  color: #999;
+  font-size: 14px;
 }
 
 .chat-messages {

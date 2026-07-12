@@ -14,4 +14,8 @@ public interface SessionService {
     Map<String, Object> getSessionMessages(Long sessionId);
 
     void saveMessage(Long sessionId, Map<String, Object> message);
+
+    Map<String, Object> getSessionMessagesByPage(Long sessionId, Integer pageNum, Integer pageSize);
+
+    Long getTotalMessageCount(Long sessionId);
 }

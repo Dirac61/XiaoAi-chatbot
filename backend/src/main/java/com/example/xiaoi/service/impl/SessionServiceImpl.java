@@ -1,6 +1,8 @@
 package com.example.xiaoi.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.example.xiaoi.entity.Session;
 import com.example.xiaoi.entity.SessionDetail;
 import com.example.xiaoi.mapper.SessionDetailMapper;
@@ -45,6 +47,7 @@ public class SessionServiceImpl implements SessionService {
 
     private static final String REDIS_KEY_PREFIX = "session:";
     private static final long REDIS_EXPIRE_DAYS = 1;
+    private static final int MAX_REDIS_MESSAGES = 20;
 
     @Override
     public Long createSession(Long userId) {
@@ -75,6 +78,7 @@ public class SessionServiceImpl implements SessionService {
         
         LambdaQueryWrapper<Session> queryWrapper = new LambdaQueryWrapper<>();
         queryWrapper.eq(Session::getUserId, userId);
+        queryWrapper.orderByDesc(Session::getUpdatedAt);
         List<Session> sessions = sessionMapper.selectList(queryWrapper);
         
         logger.info("找到 {} 个会话: userId={}", sessions.size(), userId);
@@ -83,7 +87,7 @@ public class SessionServiceImpl implements SessionService {
 
     @Override
     public Map<String, Object> getSessionMessages(Long sessionId) {
-        logger.debug("获取会话消息: sessionId={}", sessionId);
+        logger.debug("获取会话消息(最近{}条): sessionId={}", MAX_REDIS_MESSAGES, sessionId);
         
         Map<String, Object> result = new HashMap<>();
         String redisKey = REDIS_KEY_PREFIX + sessionId;
@@ -92,6 +96,9 @@ public class SessionServiceImpl implements SessionService {
         
         if (redisMessages != null && !redisMessages.isEmpty()) {
             logger.info("Redis 中找到 {} 条消息: sessionId={}", redisMessages.size(), sessionId);
+            
+            redisTemplate.expire(redisKey, REDIS_EXPIRE_DAYS, TimeUnit.DAYS);
+            logger.debug("刷新 Redis TTL: {} 天", REDIS_EXPIRE_DAYS);
             
             try {
                 List<Map<String, Object>> messages = new ArrayList<>();
@@ -108,51 +115,9 @@ public class SessionServiceImpl implements SessionService {
                 logger.error("解析 Redis 消息失败: sessionId={}, 错误={}", sessionId, e.getMessage());
                 e.printStackTrace();
             }
-        } else {
-            logger.info("Redis 中未找到消息，降级到 MySQL 查询: sessionId={}", sessionId);
         }
 
-        LambdaQueryWrapper<SessionDetail> queryWrapper = new LambdaQueryWrapper<>();
-        queryWrapper.eq(SessionDetail::getSessionId, sessionId);
-        queryWrapper.orderByAsc(SessionDetail::getCreatedAt);
-        List<SessionDetail> sessionDetails = sessionDetailMapper.selectList(queryWrapper);
-        
-        List<Map<String, Object>> messages = new ArrayList<>();
-        if (sessionDetails != null && !sessionDetails.isEmpty()) {
-            logger.info("MySQL 中找到 {} 条消息: sessionId={}", sessionDetails.size(), sessionId);
-            
-            for (SessionDetail detail : sessionDetails) {
-                if (detail.getMessages() != null && !detail.getMessages().isEmpty()) {
-                    try {
-                        Map<String, Object> msg = objectMapper.readValue(detail.getMessages(), 
-                            new TypeReference<Map<String, Object>>() {});
-                        messages.add(msg);
-                    } catch (JsonProcessingException e) {
-                        logger.error("解析 MySQL 消息失败: sessionId={}, 错误={}", sessionId, e.getMessage());
-                        e.printStackTrace();
-                    }
-                }
-            }
-            
-            if (!messages.isEmpty()) {
-                logger.info("将 {} 条 MySQL 消息写入 Redis: sessionId={}", messages.size(), sessionId);
-                for (Map<String, Object> msg : messages) {
-                    try {
-                        String msgJson = objectMapper.writeValueAsString(msg);
-                        redisTemplate.opsForList().rightPush(redisKey, msgJson);
-                    } catch (JsonProcessingException e) {
-                        logger.error("序列化消息写入 Redis 失败: {}", e.getMessage());
-                    }
-                }
-                redisTemplate.expire(redisKey, REDIS_EXPIRE_DAYS, TimeUnit.DAYS);
-                logger.info("设置 Redis 过期时间: {} 天", REDIS_EXPIRE_DAYS);
-            }
-        } else {
-            logger.info("MySQL 中也未找到消息: sessionId={}", sessionId);
-        }
-        
-        result.put("messages", messages);
-        logger.debug("返回 {} 条消息: sessionId={}", messages.size(), sessionId);
+        result.put("messages", new ArrayList<>());
         return result;
     }
 
@@ -166,6 +131,13 @@ public class SessionServiceImpl implements SessionService {
 
             String redisKey = REDIS_KEY_PREFIX + sessionId;
             redisTemplate.opsForList().rightPush(redisKey, messageJson);
+            
+            Long size = redisTemplate.opsForList().size(redisKey);
+            if (size != null && size > MAX_REDIS_MESSAGES) {
+                redisTemplate.opsForList().trim(redisKey, size - MAX_REDIS_MESSAGES, -1);
+                logger.debug("Redis消息超过 {} 条，已截断，移除 {} 条: sessionId={}", MAX_REDIS_MESSAGES, size - MAX_REDIS_MESSAGES, sessionId);
+            }
+            
             redisTemplate.expire(redisKey, REDIS_EXPIRE_DAYS, TimeUnit.DAYS);
             logger.debug("消息已保存到 Redis，过期时间 {} 天: sessionId={}", REDIS_EXPIRE_DAYS, sessionId);
 
@@ -182,10 +154,89 @@ public class SessionServiceImpl implements SessionService {
                 logger.error("消息保存到 MySQL 失败: sessionId={}", sessionId);
             }
 
+            Session session = new Session();
+            session.setId(sessionId);
+            session.setUpdatedAt(LocalDateTime.now());
+            sessionMapper.updateById(session);
+            logger.debug("更新会话更新时间: sessionId={}", sessionId);
+
             logger.info("消息保存成功: sessionId={}, role={}", sessionId, message.get("role"));
         } catch (JsonProcessingException e) {
             logger.error("消息序列化失败: sessionId={}, 错误={}", sessionId, e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    @Override
+    public Map<String, Object> getSessionMessagesByPage(Long sessionId, Integer pageNum, Integer pageSize) {
+        logger.debug("分页查询会话消息: sessionId={}, pageNum={}, pageSize={}", sessionId, pageNum, pageSize);
+        
+        Map<String, Object> result = new HashMap<>();
+        String redisKey = REDIS_KEY_PREFIX + sessionId;
+        
+        LambdaQueryWrapper<SessionDetail> queryWrapper = new LambdaQueryWrapper<>();
+        queryWrapper.eq(SessionDetail::getSessionId, sessionId);
+        queryWrapper.orderByDesc(SessionDetail::getCreatedAt);
+        
+        Page<SessionDetail> page = new Page<>(pageNum, pageSize);
+        IPage<SessionDetail> sessionDetailPage = sessionDetailMapper.selectPage(page, queryWrapper);
+        
+        List<SessionDetail> sessionDetails = sessionDetailPage.getRecords();
+        List<Map<String, Object>> messages = new ArrayList<>();
+        
+        if (sessionDetails != null && !sessionDetails.isEmpty()) {
+            logger.info("MySQL 分页查询找到 {} 条消息: sessionId={}", sessionDetails.size(), sessionId);
+            
+            for (SessionDetail detail : sessionDetails) {
+                if (detail.getMessages() != null && !detail.getMessages().isEmpty()) {
+                    try {
+                        Map<String, Object> msg = objectMapper.readValue(detail.getMessages(), 
+                            new TypeReference<Map<String, Object>>() {});
+                        messages.add(msg);
+                    } catch (JsonProcessingException e) {
+                        logger.error("解析 MySQL 消息失败: sessionId={}, 错误={}", sessionId, e.getMessage());
+                        e.printStackTrace();
+                    }
+                }
+            }
+            
+            if (pageNum == 1 && !messages.isEmpty()) {
+                logger.info("第一页查询，预热 Redis: sessionId={}", sessionId);
+                redisTemplate.delete(redisKey);
+                
+                int cacheSize = Math.min(messages.size(), pageSize);
+                for (int i = cacheSize - 1; i >= 0; i--) {
+                    try {
+                        String msgJson = objectMapper.writeValueAsString(messages.get(i));
+                        redisTemplate.opsForList().rightPush(redisKey, msgJson);
+                    } catch (JsonProcessingException e) {
+                        logger.error("序列化消息写入 Redis 失败: {}", e.getMessage());
+                    }
+                }
+                redisTemplate.expire(redisKey, REDIS_EXPIRE_DAYS, TimeUnit.DAYS);
+                logger.info("Redis 预热完成，保留最近 {} 条消息", cacheSize);
+            }
+        }
+        
+        result.put("messages", messages);
+        result.put("total", sessionDetailPage.getTotal());
+        result.put("pageNum", pageNum);
+        result.put("pageSize", pageSize);
+        result.put("hasNext", pageNum < sessionDetailPage.getPages());
+        
+        logger.debug("分页查询完成: sessionId={}, 返回 {} 条消息", sessionId, messages.size());
+        return result;
+    }
+
+    @Override
+    public Long getTotalMessageCount(Long sessionId) {
+        logger.debug("获取消息总数: sessionId={}", sessionId);
+        
+        LambdaQueryWrapper<SessionDetail> queryWrapper = new LambdaQueryWrapper<>();
+        queryWrapper.eq(SessionDetail::getSessionId, sessionId);
+        Long count = sessionDetailMapper.selectCount(queryWrapper);
+        
+        logger.info("消息总数: sessionId={}, count={}", sessionId, count);
+        return count;
     }
 }

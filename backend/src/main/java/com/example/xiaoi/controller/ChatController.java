@@ -64,21 +64,22 @@ public class ChatController {
         }
         response.setHeader("X-Session-Id", sessionId.toString());
 
+        Map<String, Object> sessionMessages = sessionService.getSessionMessages(sessionId);
+        List<Map<String, Object>> history = (List<Map<String, Object>>) sessionMessages.get("messages");
+        
+        int maxHistorySize = 20;
+        int historySize = history != null ? history.size() : 0;
+        if (history != null && history.size() > maxHistorySize) {
+            history = history.subList(history.size() - maxHistorySize, history.size());
+            logger.debug("历史消息从 {} 条裁剪到 {} 条", historySize, history.size());
+        }
+        logger.info("发送 {} 条历史消息给 agent", history != null ? history.size() : 0);
+
         Map<String, Object> userMessage = new HashMap<>();
         userMessage.put("role", "user");
         userMessage.put("content", request.getMessage());
         userMessage.put("timestamp", System.currentTimeMillis());
         sessionService.saveMessage(sessionId, userMessage);
-
-        Map<String, Object> sessionMessages = sessionService.getSessionMessages(sessionId);
-        List<Map<String, Object>> history = (List<Map<String, Object>>) sessionMessages.get("messages");
-        
-        int historySize = history != null ? history.size() : 0;
-        if (history != null && history.size() > 10) {
-            history = history.subList(history.size() - 10, history.size());
-            logger.debug("历史消息从 {} 条裁剪到 {} 条", historySize, history.size());
-        }
-        logger.info("发送 {} 条历史消息给 agent", history != null ? history.size() : 0);
 
         Map<String, Object> requestBody = new HashMap<>();
         requestBody.put("message", request.getMessage());

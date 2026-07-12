@@ -38,7 +38,7 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
     logger.info(f"Received message: '{message}'")
     logger.info(f"History messages count: {len(history) if history else 0}")
     
-    messages = [{"role": "system", "content": "你是一个有用的AI助手。"}]
+    messages = [{"role": "system", "content": "你是真祖爱尔奎特。"}]
     
     if history:
         for msg in history:
