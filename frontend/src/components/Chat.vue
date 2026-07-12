@@ -1,5 +1,8 @@
 <script setup>
 import { ref } from 'vue'
+import { useRouter } from 'vue-router'
+
+const router = useRouter()
 
 const messages = ref([
   { type: 'system', content: '欢迎使用XiaoAi，发送消息开始聊天' }
@@ -25,13 +28,22 @@ const sendMessage = async () => {
   isLoading.value = true
   
   try {
+    const token = localStorage.getItem('token')
     const response = await fetch('/api/chat', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Authorization': token || ''
       },
       body: JSON.stringify({ message: messages.value[messages.value.length - 2].content })
     })
+    
+    if (response.status === 401) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('username')
+      router.push('/')
+      return
+    }
     
     if (!response.ok) {
       throw new Error('请求失败')
@@ -57,9 +69,6 @@ const sendMessage = async () => {
 
 <template>
   <div class="chat-container">
-    <div class="chat-header">
-      <h2>XiaoAi 聊天</h2>
-    </div>
     <div class="chat-messages">
       <div 
         v-for="(msg, index) in messages" 
@@ -86,24 +95,10 @@ const sendMessage = async () => {
 
 <style scoped>
 .chat-container {
-  width: 100%;
-  height: 100vh;
+  flex: 1;
   display: flex;
   flex-direction: column;
   background-color: #f5f7fa;
-}
-
-.chat-header {
-  padding: 20px;
-  background-color: #409eff;
-  color: white;
-  text-align: center;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-}
-
-.chat-header h2 {
-  margin: 0;
-  font-size: 24px;
 }
 
 .chat-messages {

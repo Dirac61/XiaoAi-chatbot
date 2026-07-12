@@ -1,14 +1,19 @@
 <script setup>
-import Chat from './components/Chat.vue'
 </script>
 
 <template>
-  <Chat />
+  <router-view />
 </template>
 
 <style>
-#app {
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
   width: 100%;
-  height: 100vh;
+  height: 100%;
 }
 </style>
