@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.example.xiaoi.entity.User;
 import com.example.xiaoi.mapper.UserMapper;
 import com.example.xiaoi.service.UserService;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -23,6 +24,9 @@ public class UserServiceImpl implements UserService {
 
     @Autowired
     private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
@@ -58,7 +62,16 @@ public class UserServiceImpl implements UserService {
         userInfo.put("username", user.getUsername());
         userInfo.put("token", token);
         
-        redisTemplate.opsForValue().set("token:" + token, user.getId().toString(), 24, TimeUnit.HOURS);
+        Map<String, Object> redisUser = new HashMap<>();
+        redisUser.put("id", user.getId());
+        redisUser.put("username", user.getUsername());
+        
+        try {
+            String userJson = objectMapper.writeValueAsString(redisUser);
+            redisTemplate.opsForValue().set("token:" + token, userJson, 24, TimeUnit.HOURS);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
         
         result.put("code", 200);
         result.put("message", "登录成功");

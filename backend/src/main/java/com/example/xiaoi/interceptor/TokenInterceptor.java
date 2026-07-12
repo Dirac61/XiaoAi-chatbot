@@ -1,5 +1,7 @@
 package com.example.xiaoi.interceptor;
 
+import com.example.xiaoi.context.UserContext;
+import com.example.xiaoi.entity.User;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -34,9 +36,9 @@ public class TokenInterceptor implements HandlerInterceptor {
             return false;
         }
 
-        String userId = redisTemplate.opsForValue().get("token:" + token);
+        String userJson = redisTemplate.opsForValue().get("token:" + token);
         
-        if (userId == null) {
+        if (userJson == null) {
             response.setContentType("application/json;charset=UTF-8");
             response.setStatus(401);
             Map<String, Object> result = new HashMap<>();
@@ -46,7 +48,29 @@ public class TokenInterceptor implements HandlerInterceptor {
             return false;
         }
 
-        request.setAttribute("userId", userId);
+        try {
+            Map<String, Object> userMap = objectMapper.readValue(userJson, Map.class);
+            User user = new User();
+            user.setId(((Number) userMap.get("id")).longValue());
+            user.setUsername((String) userMap.get("username"));
+            UserContext.setUser(user);
+            request.setAttribute("userId", user.getId());
+        } catch (Exception e) {
+            e.printStackTrace();
+            response.setContentType("application/json;charset=UTF-8");
+            response.setStatus(401);
+            Map<String, Object> result = new HashMap<>();
+            result.put("code", 401);
+            result.put("message", "用户信息解析失败");
+            response.getWriter().write(objectMapper.writeValueAsString(result));
+            return false;
+        }
+
         return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) throws Exception {
+        UserContext.clear();
     }
 }
