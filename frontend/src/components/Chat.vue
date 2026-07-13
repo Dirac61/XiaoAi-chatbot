@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 
 const router = useRouter()
@@ -10,6 +10,66 @@ const messages = ref([
 
 const inputMessage = ref('')
 const isLoading = ref(false)
+const isLoadingMore = ref(false)
+const hasMore = ref(true)
+const pageNum = ref(1)
+const pageSize = ref(20)
+const chatContainer = ref(null)
+
+const loadMessages = async (page = 1) => {
+  if (isLoadingMore.value) return
+  
+  isLoadingMore.value = true
+  
+  try {
+    const token = localStorage.getItem('token')
+    const response = await fetch(`/api/session/messages/page?sessionId=1&pageNum=${page}&pageSize=${pageSize.value}`, {
+      headers: {
+        'Authorization': token || ''
+      }
+    })
+    
+    if (response.status === 401) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('username')
+      router.push('/')
+      return
+    }
+    
+    const data = await response.json()
+    
+    if (data.code === 200 && data.data) {
+      const newMessages = data.data.messages || []
+      
+      const formattedMessages = newMessages.map(msg => ({
+        type: msg.role === 'user' ? 'user' : 'bot',
+        content: msg.content
+      }))
+      
+      if (page === 1) {
+        messages.value = [...formattedMessages.reverse()]
+      } else {
+        messages.value = [...formattedMessages.reverse(), ...messages.value]
+      }
+      
+      hasMore.value = data.data.hasNext || false
+      pageNum.value = page
+    }
+  } catch (error) {
+    console.error('加载消息失败:', error)
+  } finally {
+    isLoadingMore.value = false
+  }
+}
+
+const handleScroll = async () => {
+  const container = chatContainer.value
+  if (!container || isLoadingMore.value) return
+  
+  if (container.scrollTop < 50 && hasMore.value) {
+    await loadMessages(pageNum.value + 1)
+  }
+}
 
 const sendMessage = async () => {
   if (!inputMessage.value.trim() || isLoading.value) return
@@ -65,10 +125,17 @@ const sendMessage = async () => {
     isLoading.value = false
   }
 }
+
+onMounted(async () => {
+  await loadMessages(1)
+})
 </script>
 
 <template>
-  <div class="chat-container">
+  <div class="chat-container" ref="chatContainer" @scroll="handleScroll">
+    <div v-if="isLoadingMore && messages.length > 1" class="loading-more">
+      加载中...
+    </div>
     <div class="chat-messages">
       <div 
         v-for="(msg, index) in messages" 
@@ -99,6 +166,14 @@ const sendMessage = async () => {
   display: flex;
   flex-direction: column;
   background-color: #f5f7fa;
+  overflow: hidden;
+}
+
+.loading-more {
+  text-align: center;
+  padding: 10px;
+  color: #999;
+  font-size: 14px;
 }
 
 .chat-messages {

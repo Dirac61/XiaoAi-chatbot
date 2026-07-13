@@ -9,25 +9,25 @@ import lombok.Data;
 import java.time.LocalDateTime;
 
 /**
- * 用户实体类
- * 对应 user 表，存储用户基本信息
- * 密码使用 BCrypt 加密存储
+ * 会话详情实体类
+ * 对应 session_detail 表，存储每条消息的详细内容
+ * 每条记录对应一条消息（JSON 格式），支持分页查询历史消息
  */
 @Data
-@TableName("user")
-public class User {
+@TableName("session_detail")
+public class SessionDetail {
 
-    /** 用户 ID，自增 */
+    /** 主键 ID，自增 */
     @TableId(type = IdType.AUTO)
     private Long id;
 
-    /** 用户名，唯一标识 */
-    @TableField("username")
-    private String username;
+    /** 会话 ID，关联 session 表 */
+    @TableField("session_id")
+    private Long sessionId;
 
-    /** 密码，BCrypt 加密存储 */
-    @TableField("password")
-    private String password;
+    /** 消息内容，JSON 格式存储（包含 role、content、timestamp） */
+    @TableField("messages")
+    private String messages;
 
     /** 创建时间 */
     @TableField("created_at")
