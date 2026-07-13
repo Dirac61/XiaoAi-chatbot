@@ -98,6 +98,8 @@ public class ChatController {
         Map<String, Object> requestBody = new HashMap<>();
         requestBody.put("message", request.getMessage());
         requestBody.put("history", history);
+        requestBody.put("user_id", userId);
+        requestBody.put("session_id", sessionId);
 
         return outputStream -> {
             StringBuilder responseBuilder = new StringBuilder();
