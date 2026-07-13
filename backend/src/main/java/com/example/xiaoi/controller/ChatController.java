@@ -11,7 +11,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.MediaType;
-import org.springframework.http.client.reactive.ClientHttpResponse;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -20,6 +19,7 @@ import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -52,14 +52,28 @@ public class ChatController {
     @Autowired
     private WebClient webClient;
 
+    /**
+     * 聊天接口 - 流式响应
+     * 架构说明：
+     *   前端 → Spring MVC Controller → WebClient(异步) → Agent(FastAPI) → LLM
+     *   由于 Spring MVC 的 StreamingResponseBody 是阻塞式回调，而 WebClient 是响应式异步调用，
+     *   需要用 CountDownLatch 将异步流桥接到阻塞的 Servlet 线程中。
+     *   Disposable 用于在中断/异常时正确释放 reactive subscription，避免资源泄漏。
+     * @param request 聊天请求（包含 sessionId 和 message）
+     * @param response HTTP 响应对象，用于设置自定义 header
+     * @return StreamingResponseBody 流式响应体
+     */
     @PostMapping(value = "/chat", produces = MediaType.TEXT_PLAIN_VALUE)
     public StreamingResponseBody chat(@RequestBody ChatRequest request, HttpServletResponse response) {
         Long userId = UserContext.getUserId();
         logger.info("收到聊天请求 - userId: {}, 消息: '{}', sessionId: {}", 
             userId, request.getMessage(), request.getSessionId());
 
-        Long sessionId = request.getSessionId() != null ? request.getSessionId() : sessionService.createSession(userId);
-        if (request.getSessionId() == null) {
+        final Long sessionId;
+        if (request.getSessionId() != null) {
+            sessionId = request.getSessionId();
+        } else {
+            sessionId = sessionService.createSession(userId);
             logger.info("创建新会话: {}", sessionId);
         }
         response.setHeader("X-Session-Id", sessionId.toString());
@@ -88,10 +102,10 @@ public class ChatController {
         return outputStream -> {
             StringBuilder responseBuilder = new StringBuilder();
             CountDownLatch latch = new CountDownLatch(1);
+            Disposable disposable = null;
 
             try {
                 String jsonBody = objectMapper.writeValueAsString(requestBody);
-                logger.debug("发送给 agent 的请求体: {}", jsonBody);
 
                 AtomicInteger chunkCount = new AtomicInteger(0);
 
@@ -102,7 +116,7 @@ public class ChatController {
                         .body(BodyInserters.fromValue(jsonBody))
                         .exchange();
 
-                clientResponseMono.flatMapMany(clientResponse -> {
+                disposable = clientResponseMono.flatMapMany(clientResponse -> {
                     logger.info("Agent 响应状态码: {}", clientResponse.statusCode());
                     return clientResponse.bodyToFlux(DataBuffer.class);
                 }).subscribe(
@@ -115,13 +129,11 @@ public class ChatController {
                             String chunk = new String(bytes, StandardCharsets.UTF_8);
                             int currentCount = chunkCount.incrementAndGet();
                             
-                            logger.info("收到 agent 数据块 {}: '{}'", currentCount, chunk);
+                            logger.debug("收到 agent 数据块 {}: '{}'", currentCount, chunk);
                             
                             responseBuilder.append(chunk);
                             outputStream.write(bytes);
                             outputStream.flush();
-                            
-                            logger.debug("数据块已写入输出流，当前累计响应长度: {} 字符", responseBuilder.length());
                         } catch (IOException e) {
                             logger.error("写入输出流失败: {}", e.getMessage());
                         }
@@ -140,18 +152,29 @@ public class ChatController {
                 if (!completed) {
                     logger.warn("流超时，超过 120 秒");
                 }
+            } catch (InterruptedException e) {
+                logger.warn("流式传输被中断: sessionId={}", sessionId);
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
                 logger.error("流式传输错误: {}", e.getMessage(), e);
+            } finally {
+                if (disposable != null && !disposable.isDisposed()) {
+                    disposable.dispose();
+                    logger.debug("已释放 reactive subscription");
+                }
             }
 
-            Map<String, Object> assistantMessage = new HashMap<>();
-            assistantMessage.put("role", "assistant");
-            assistantMessage.put("content", responseBuilder.toString());
-            assistantMessage.put("timestamp", System.currentTimeMillis());
-            sessionService.saveMessage(sessionId, assistantMessage);
-            
-            logger.info("聊天请求完成 - sessionId: {}, 响应长度: {} 字符", 
-                sessionId, responseBuilder.length());
+            if (responseBuilder.length() > 0) {
+                Map<String, Object> assistantMessage = new HashMap<>();
+                assistantMessage.put("role", "assistant");
+                assistantMessage.put("content", responseBuilder.toString());
+                assistantMessage.put("timestamp", System.currentTimeMillis());
+                sessionService.saveMessage(sessionId, assistantMessage);
+                logger.info("聊天请求完成 - sessionId: {}, 响应长度: {} 字符", 
+                    sessionId, responseBuilder.length());
+            } else {
+                logger.warn("聊天请求无有效响应 - sessionId: {}", sessionId);
+            }
         };
     }
 }

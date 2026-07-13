@@ -5,6 +5,8 @@ import com.example.xiaoi.entity.User;
 import com.example.xiaoi.mapper.UserMapper;
 import com.example.xiaoi.service.UserService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -18,6 +20,8 @@ import java.util.concurrent.TimeUnit;
 
 @Service
 public class UserServiceImpl implements UserService {
+
+    private static final Logger logger = LoggerFactory.getLogger(UserServiceImpl.class);
 
     @Autowired
     private UserMapper userMapper;
@@ -45,14 +49,14 @@ public class UserServiceImpl implements UserService {
             user.setCreatedAt(LocalDateTime.now());
             user.setUpdatedAt(LocalDateTime.now());
             userMapper.insert(user);
-            System.out.println("Registered new user: " + username);
+            logger.info("注册新用户: username={}", username);
         } else {
             if (!passwordEncoder.matches(password, user.getPassword())) {
                 result.put("code", 401);
                 result.put("message", "密码错误");
                 return result;
             }
-            System.out.println("Login successful: " + username);
+            logger.info("用户登录成功: username={}", username);
         }
 
         String token = UUID.randomUUID().toString().replace("-", "");
@@ -69,8 +73,9 @@ public class UserServiceImpl implements UserService {
         try {
             String userJson = objectMapper.writeValueAsString(redisUser);
             redisTemplate.opsForValue().set("token:" + token, userJson, 24, TimeUnit.HOURS);
+            logger.info("Token 缓存成功: username={}, token={}", username, token.substring(0, 8));
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.error("Token 缓存失败: username={}, 错误={}", username, e.getMessage(), e);
         }
         
         result.put("code", 200);

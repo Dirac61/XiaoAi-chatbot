@@ -3,6 +3,8 @@ package com.example.xiaoi.interceptor;
 import com.example.xiaoi.context.UserContext;
 import com.example.xiaoi.entity.User;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -15,6 +17,8 @@ import java.util.Map;
 
 @Component
 public class TokenInterceptor implements HandlerInterceptor {
+
+    private static final Logger logger = LoggerFactory.getLogger(TokenInterceptor.class);
 
     @Autowired
     private StringRedisTemplate redisTemplate;
@@ -56,7 +60,7 @@ public class TokenInterceptor implements HandlerInterceptor {
             UserContext.setUser(user);
             request.setAttribute("userId", user.getId());
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.error("用户信息解析失败: {}", e.getMessage(), e);
             response.setContentType("application/json;charset=UTF-8");
             response.setStatus(401);
             Map<String, Object> result = new HashMap<>();

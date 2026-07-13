@@ -1,4 +1,4 @@
-<script setup>import { onMounted, ref } from 'vue';
+<script setup>import { nextTick, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 const router = useRouter();
 const currentUser = ref('');
@@ -73,6 +73,11 @@ const createNewSession = async () => {
 const loadMessages = async (page = 1) => {
  if (!currentSessionId.value || isLoadingMore.value) return;
  
+ // 加载更早的历史消息前，保存容器的滚动位置以在加载后恢复
+ const container = chatContainer.value;
+ const oldScrollHeight = container ? container.scrollHeight : 0;
+ const oldScrollTop = container ? container.scrollTop : 0;
+ 
  isLoadingMore.value = true;
  
  try {
@@ -113,6 +118,14 @@ const loadMessages = async (page = 1) => {
  console.error('加载消息失败:', error);
  } finally {
  isLoadingMore.value = false;
+ 
+ // 加载完更早的历史消息后，保持原来的可视位置
+ // 新消息 prepend 到列表前面导致容器变高，需要把 scrollTop 补偿新消息的高度
+ if (page > 1 && container) {
+ nextTick(() => {
+ container.scrollTop = (container.scrollHeight - oldScrollHeight) + oldScrollTop;
+ });
+ }
  }
 };
 const selectSession = async (session) => {
