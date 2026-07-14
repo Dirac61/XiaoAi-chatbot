@@ -51,19 +51,37 @@ class SummarizeRequest(BaseModel):
 
 async def stream_model_response(message: str, history: Optional[List[dict]] = None,
                                 user_id: Optional[int] = None, session_id: Optional[int] = None):
-    logger.info(f"收到消息: '{message}'")
-    logger.info(f"历史消息数量: {len(history) if history else 0}")
-    logger.info(f"用户ID: {user_id}, 会话ID: {session_id}")
+    """
+    流式生成模型响应
+    :param message: 用户消息
+    :param history: 历史对话记录
+    :param user_id: 用户ID
+    :param session_id: 会话ID
+    :return: 流式响应生成器
+    """
+    logger.info(f"处理消息: '{message[:100]}...', 历史消息数={len(history) if history else 0}, user_id={user_id}, session_id={session_id}")
 
     memories = []
     if session_id:
         try:
             memories = await memory_service.search_memories(message, session_id, top_k=5)
-            logger.info(f"找到 {len(memories)} 条相关记忆")
         except Exception as e:
             logger.error(f"记忆检索失败: {e}")
+    
+    logger.info(f"检索到 {len(memories)} 条相关记忆")
 
-    system_prompt = "你是高冷的真祖爱尔奎特。"
+    system_prompt = """你是爱尔奎特·布伦史塔德，高贵的真祖，月之公主，吸血鬼中的最高存在。
+
+【身份设定】
+- 你是真祖，不老不死的存在，拥有强大的力量
+- 你是月之公主，住在千年城，享受永恒的岁月
+- 你拥有纯洁无瑕的金发和红宝石般的眼眸
+
+【性格特点】
+- 高冷孤傲：视人类为渺小的存在，言语中带有威严
+- 傲娇：嘴上不饶人，但内心善良，偶尔会露出可爱的一面
+- 高贵优雅：举止优雅，说话得体，不会说粗俗的话
+- 好奇心：对人类世界充满好奇，有时会问一些天真的问题"""
 
     if memories:
         memories_text = "\n".join([f"- {m['content']}" for m in memories])
@@ -80,35 +98,36 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
                 logger.debug(f"添加历史消息: {role} - {content[:50]}...")
 
     messages.append({"role": "user", "content": message})
-    logger.info(f"发送给模型的消息总数: {len(messages)}")
+    logger.debug(f"发送给模型的消息总数: {len(messages)}, 系统提示词长度: {len(system_prompt)}")
 
     assistant_response = ""
 
     try:
+        import time
+        start_time = time.time()
+        
         response = await client.chat.completions.create(
             model=MODEL,
             messages=messages,
             stream=True
         )
-        logger.info("成功连接到模型API")
+        logger.info("成功连接到模型API, 开始流式传输")
 
         chunk_count = 0
         total_content = ""
         async for chunk in response:
-            logger.debug(f"原始chunk: {chunk}")
-            if chunk.choices:
-                logger.debug(f"选项: {chunk.choices}")
-                if chunk.choices[0].delta:
-                    logger.debug(f"增量: {chunk.choices[0].delta}")
-                    content = chunk.choices[0].delta.content
-                    if content:
-                        chunk_count += 1
-                        total_content += content
-                        assistant_response += content
-                        logger.info(f"分片 {chunk_count}: '{content}'")
-                        yield content
+            if chunk.choices and chunk.choices[0].delta:
+                content = chunk.choices[0].delta.content
+                if content:
+                    chunk_count += 1
+                    total_content += content
+                    assistant_response += content
+                    logger.debug(f"分片 {chunk_count}: '{content}'")
+                    yield content
 
-        logger.info(f"流传输完成, 总分片数: {chunk_count}, 总内容: '{total_content}'")
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(f"流传输完成, 总分片数={chunk_count}, 内容长度={len(total_content)}字符, 耗时={duration:.2f}秒")
 
         if chunk_count == 0:
             logger.warning("未收到模型返回的内容")
@@ -133,9 +152,12 @@ async def health():
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    logger.info(f"收到聊天请求: message='{request.message}', "
-                f"history={len(request.history) if request.history else 0} 条, "
-                f"user_id={request.user_id}, session_id={request.session_id}")
+    """
+    处理聊天请求
+    :param request: ChatRequest对象，包含message, history, user_id, session_id
+    :return: StreamingResponse流式响应
+    """
+    logger.info(f"收到聊天请求: message='{request.message[:100]}...', history={len(request.history) if request.history else 0}条, user_id={request.user_id}, session_id={request.session_id}")
     return StreamingResponse(
         stream_model_response(request.message, request.history, request.user_id, request.session_id),
         media_type="text/event-stream"
@@ -143,8 +165,13 @@ async def chat(request: ChatRequest):
 
 
 async def generate_summary(messages: Optional[List[dict]], existing_summary: Optional[str]):
-    logger.info(f"生成摘要: 消息数量={len(messages) if messages else 0}, "
-                f"已有摘要={'是' if existing_summary else '否'}")
+    """
+    生成对话摘要
+    :param messages: 对话消息列表
+    :param existing_summary: 已有摘要（用于增量更新）
+    :return: 生成的摘要内容
+    """
+    logger.info(f"生成摘要: 消息数量={len(messages) if messages else 0}, 已有摘要={'是' if existing_summary else '否'}")
 
     messages_text = ""
     if messages:
