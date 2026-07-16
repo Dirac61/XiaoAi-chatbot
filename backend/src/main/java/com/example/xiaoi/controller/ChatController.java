@@ -2,6 +2,8 @@ package com.example.xiaoi.controller;
 
 import com.example.xiaoi.context.UserContext;
 import com.example.xiaoi.dto.ChatRequest;
+import com.example.xiaoi.service.ASRService;
+import com.example.xiaoi.service.OSSUploadService;
 import com.example.xiaoi.service.SessionService;
 import com.example.xiaoi.utils.SnowflakeUtil;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -11,10 +13,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.MediaType;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -25,7 +26,6 @@ import reactor.core.publisher.Mono;
 
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
@@ -52,22 +52,32 @@ public class ChatController {
     @Autowired
     private WebClient webClient;
 
-    /**
-     * 聊天接口 - 流式响应
-     * 架构说明：
-     *   前端 → Spring MVC Controller → WebClient(异步) → Agent(FastAPI) → LLM
-     *   由于 Spring MVC 的 StreamingResponseBody 是阻塞式回调，而 WebClient 是响应式异步调用，
-     *   需要用 CountDownLatch 将异步流桥接到阻塞的 Servlet 线程中。
-     *   Disposable 用于在中断/异常时正确释放 reactive subscription，避免资源泄漏。
-     * @param request 聊天请求（包含 sessionId 和 message）
-     * @param response HTTP 响应对象，用于设置自定义 header
-     * @return StreamingResponseBody 流式响应体
-     */
+    @Autowired
+    private OSSUploadService ossUploadService;
+
+    @Autowired
+    private ASRService asrService;
+
+    private static final long MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+    private static final long MAX_FILE_SIZE = 50 * 1024 * 1024;
+    
+    private static final String[] ALLOWED_IMAGE_TYPES = {
+        "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"
+    };
+    
+    private static final String[] ALLOWED_FILE_TYPES = {
+        "application/pdf", "application/msword", 
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "text/plain", "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    };
+
     @PostMapping(value = "/chat", produces = MediaType.TEXT_PLAIN_VALUE)
     public StreamingResponseBody chat(@RequestBody ChatRequest request, HttpServletResponse response) {
         Long userId = UserContext.getUserId();
-        logger.info("收到聊天请求 - userId: {}, 消息: '{}', sessionId: {}", 
-            userId, request.getMessage(), request.getSessionId());
+        String messageType = request.getMessageType() != null ? request.getMessageType() : "TEXT";
+        logger.info("收到聊天请求 - userId: {}, messageType: {}, sessionId: {}", 
+            userId, messageType, request.getSessionId());
 
         final Long sessionId;
         if (request.getSessionId() != null) {
@@ -90,16 +100,23 @@ public class ChatController {
         logger.info("发送 {} 条历史消息给 agent", history != null ? history.size() : 0);
 
         Map<String, Object> userMessage = new HashMap<>();
+        String messageUuid = java.util.UUID.randomUUID().toString();
         userMessage.put("role", "user");
         userMessage.put("content", request.getMessage());
+        userMessage.put("messageType", messageType);
+        userMessage.put("mediaUrl", request.getMediaUrl());
         userMessage.put("timestamp", System.currentTimeMillis());
-        sessionService.saveMessage(sessionId, userMessage);
+        userMessage.put("messageUuid", messageUuid);
+        sessionService.saveMessage(sessionId, userMessage, messageType, request.getMediaUrl());
 
         Map<String, Object> requestBody = new HashMap<>();
         requestBody.put("message", request.getMessage());
         requestBody.put("history", history);
         requestBody.put("user_id", userId);
         requestBody.put("session_id", sessionId);
+        requestBody.put("message_type", messageType);
+        requestBody.put("media_url", request.getMediaUrl());
+        requestBody.put("message_uuid", messageUuid);
 
         return outputStream -> {
             StringBuilder responseBuilder = new StringBuilder();
@@ -170,13 +187,141 @@ public class ChatController {
                 Map<String, Object> assistantMessage = new HashMap<>();
                 assistantMessage.put("role", "assistant");
                 assistantMessage.put("content", responseBuilder.toString());
+                assistantMessage.put("messageType", "TEXT");
+                assistantMessage.put("mediaUrl", null);
                 assistantMessage.put("timestamp", System.currentTimeMillis());
-                sessionService.saveMessage(sessionId, assistantMessage);
+                sessionService.saveMessage(sessionId, assistantMessage, "TEXT", null);
                 logger.info("聊天请求完成 - sessionId: {}, 响应长度: {} 字符", 
                     sessionId, responseBuilder.length());
             } else {
                 logger.warn("聊天请求无有效响应 - sessionId: {}", sessionId);
             }
         };
+    }
+
+    @PostMapping("/upload/image")
+    public ResponseEntity<Map<String, Object>> uploadImage(@RequestParam("file") MultipartFile file) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            if (!isValidImageType(file.getContentType())) {
+                result.put("code", 400);
+                result.put("message", "不支持的图片格式，仅支持JPG、PNG、GIF、WebP");
+                return ResponseEntity.badRequest().body(result);
+            }
+            
+            if (file.getSize() > MAX_IMAGE_SIZE) {
+                result.put("code", 400);
+                result.put("message", "图片大小超过限制（最大10MB）");
+                return ResponseEntity.badRequest().body(result);
+            }
+
+            String url = ossUploadService.uploadImage(file);
+            result.put("code", 200);
+            result.put("data", url);
+            return ResponseEntity.ok(result);
+        } catch (IOException e) {
+            logger.error("图片上传失败: {}", e.getMessage());
+            result.put("code", 500);
+            result.put("message", "图片上传失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(result);
+        }
+    }
+
+    @PostMapping("/upload/file")
+    public ResponseEntity<Map<String, Object>> uploadFile(@RequestParam("file") MultipartFile file) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            if (!isValidFileType(file.getContentType())) {
+                result.put("code", 400);
+                result.put("message", "不支持的文件格式，仅支持PDF、DOC、DOCX、TXT、XLS、XLSX");
+                return ResponseEntity.badRequest().body(result);
+            }
+            
+            if (file.getSize() > MAX_FILE_SIZE) {
+                result.put("code", 400);
+                result.put("message", "文件大小超过限制（最大50MB）");
+                return ResponseEntity.badRequest().body(result);
+            }
+
+            String url = ossUploadService.uploadFile(file);
+            result.put("code", 200);
+            result.put("data", url);
+            return ResponseEntity.ok(result);
+        } catch (IOException e) {
+            logger.error("文件上传失败: {}", e.getMessage());
+            result.put("code", 500);
+            result.put("message", "文件上传失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(result);
+        }
+    }
+
+    private boolean isValidImageType(String contentType) {
+        if (contentType == null) return false;
+        for (String type : ALLOWED_IMAGE_TYPES) {
+            if (type.equalsIgnoreCase(contentType)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isValidFileType(String contentType) {
+        if (contentType == null) return false;
+        for (String type : ALLOWED_FILE_TYPES) {
+            if (type.equalsIgnoreCase(contentType)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @PostMapping("/speech-to-text")
+    public ResponseEntity<Map<String, Object>> speechToText(@RequestParam("audio") MultipartFile audioFile) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            byte[] audioData = audioFile.getBytes();
+            String text = asrService.speechToText(audioData);
+            
+            if (text != null && !text.isEmpty()) {
+                result.put("code", 200);
+                result.put("data", text);
+                return ResponseEntity.ok(result);
+            } else {
+                result.put("code", 500);
+                result.put("message", "语音转文本失败");
+                return ResponseEntity.internalServerError().body(result);
+            }
+        } catch (IOException e) {
+            logger.error("语音转文本失败: {}", e.getMessage());
+            result.put("code", 500);
+            result.put("message", "语音转文本失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(result);
+        }
+    }
+
+    @PostMapping("/message/update-content")
+    public ResponseEntity<Map<String, Object>> updateMessageContent(@RequestBody Map<String, Object> request) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            Long sessionId = Long.parseLong(request.get("session_id").toString());
+            String messageUuid = (String) request.get("message_uuid");
+            String message = (String) request.get("message");
+            String extractedText = (String) request.get("extracted_text");
+            
+            sessionService.updateMessageContent(sessionId, messageUuid, message, extractedText);
+            
+            result.put("code", 200);
+            result.put("message", "消息内容更新成功");
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            logger.error("更新消息内容失败: {}", e.getMessage());
+            result.put("code", 500);
+            result.put("message", "更新消息内容失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(result);
+        }
     }
 }

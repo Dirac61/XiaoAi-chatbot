@@ -8,6 +8,7 @@ backend/target/
 *.class
 *.jar
 *.war
+backend/src/main/resources/application-local.yml
 
 # Python
 agent/__pycache__/

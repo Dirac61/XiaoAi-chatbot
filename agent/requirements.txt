@@ -9,3 +9,5 @@ numpy>=1.26.0
 scipy>=1.11.0
 jieba>=0.42.1
 redis>=5.0.0
+python-docx>=1.1.0
+PyPDF2>=2.0.0

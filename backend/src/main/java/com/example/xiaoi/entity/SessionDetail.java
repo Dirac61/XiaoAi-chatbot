@@ -25,9 +25,17 @@ public class SessionDetail {
     @TableField("session_id")
     private Long sessionId;
 
-    /** 消息内容，JSON 格式存储（包含 role、content、timestamp） */
+    /** 消息内容，JSON 格式存储（包含 role、content、timestamp、messageType、mediaUrl） */
     @TableField("messages")
     private String messages;
+
+    /** 消息类型：TEXT/IMAGE/FILE/VOICE */
+    @TableField("message_type")
+    private String messageType;
+
+    /** 媒体文件地址（OSS URL），TEXT和VOICE类型为NULL */
+    @TableField("media_url")
+    private String mediaUrl;
 
     /** 创建时间 */
     @TableField("created_at")

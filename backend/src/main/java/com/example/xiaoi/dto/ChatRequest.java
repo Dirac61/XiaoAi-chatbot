@@ -4,7 +4,7 @@ import lombok.Data;
 
 /**
  * 聊天请求 DTO
- * 用于接收前端发送的聊天消息
+ * 用于接收前端发送的聊天消息（支持多模态：文本、图片、文件、语音）
  */
 @Data
 public class ChatRequest {
@@ -14,4 +14,8 @@ public class ChatRequest {
     private Long sessionId;
     /** 用户 ID（预留字段，实际从 Token 中获取） */
     private Long userId;
+    /** 消息类型：TEXT/IMAGE/FILE/VOICE，默认TEXT */
+    private String messageType = "TEXT";
+    /** 媒体文件地址（OSS URL），IMAGE/FILE类型使用 */
+    private String mediaUrl;
 }

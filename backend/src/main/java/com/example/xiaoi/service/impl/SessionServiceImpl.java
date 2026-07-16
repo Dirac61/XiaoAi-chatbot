@@ -49,6 +49,12 @@ public class SessionServiceImpl implements SessionService {
     @Autowired
     private SessionAsyncService asyncService;
 
+    @Autowired
+    private com.aliyun.oss.OSS ossClient;
+
+    @Autowired
+    private com.example.xiaoi.config.OSSConfig ossConfig;
+
     private static final String REDIS_KEY_PREFIX = "session:";
     private static final String REDIS_TURN_COUNT_PREFIX = "session:turn:";
     private static final long REDIS_EXPIRE_DAYS = 1;
@@ -174,11 +180,16 @@ public class SessionServiceImpl implements SessionService {
      * 注意：异步方法必须通过独立的 Bean（SessionAsyncService）调用，
      *       因为 Spring @Async 基于 AOP 代理，同类内部方法调用不经过代理会导致 @Async 失效
      * @param sessionId 会话 ID
-     * @param message 消息内容（包含 role, content, timestamp）
+     * @param message 消息内容（包含 role, content, timestamp, messageType, mediaUrl）
+     * @param messageType 消息类型：TEXT/IMAGE/FILE/VOICE
+     * @param mediaUrl 媒体文件地址（OSS URL），TEXT和VOICE类型为null
      */
     @Override
-    public void saveMessage(Long sessionId, Map<String, Object> message) {
+    public void saveMessage(Long sessionId, Map<String, Object> message, String messageType, String mediaUrl) {
         try {
+            if (!message.containsKey("messageUuid")) {
+                message.put("messageUuid", java.util.UUID.randomUUID().toString());
+            }
             String messageJson = objectMapper.writeValueAsString(message);
             String redisKey = REDIS_KEY_PREFIX + sessionId;
             
@@ -200,7 +211,7 @@ public class SessionServiceImpl implements SessionService {
             }
 
             // MySQL 写入异步执行，通过独立 Bean 调用确保 @Async 生效
-            asyncService.asyncSaveMessageToDb(sessionId, messageJson);
+            asyncService.asyncSaveMessageToDb(sessionId, messageJson, messageType, mediaUrl);
         } catch (JsonProcessingException e) {
             logger.error("消息序列化失败: sessionId={}, 错误={}", sessionId, e.getMessage());
         }
@@ -314,5 +325,107 @@ public class SessionServiceImpl implements SessionService {
         LambdaQueryWrapper<SessionDetail> queryWrapper = new LambdaQueryWrapper<>();
         queryWrapper.eq(SessionDetail::getSessionId, sessionId);
         return sessionDetailMapper.selectCount(queryWrapper);
+    }
+
+    @Override
+    public void updateMessageContent(Long sessionId, String messageUuid, String message, String extractedText) {
+        logger.info("开始更新消息内容: sessionId={}, messageUuid={}, extractedTextLength={}", 
+            sessionId, messageUuid, extractedText != null ? extractedText.length() : 0);
+        
+        try {
+            String redisKey = REDIS_KEY_PREFIX + sessionId;
+            List<String> redisMessages = redisTemplate.opsForList().range(redisKey, 0, -1);
+            
+            if (redisMessages != null) {
+                logger.info("Redis中找到{}条消息", redisMessages.size());
+                for (int i = 0; i < redisMessages.size(); i++) {
+                    try {
+                        Map<String, Object> msg = objectMapper.readValue(redisMessages.get(i), 
+                            new TypeReference<Map<String, Object>>() {});
+                        String uuid = (String) msg.get("messageUuid");
+                        logger.debug("检查消息[{}]: messageUuid={}", i, uuid);
+                        if (messageUuid.equals(uuid)) {
+                            msg.put("extractedText", extractedText);
+                            String updatedJson = objectMapper.writeValueAsString(msg);
+                            redisTemplate.opsForList().set(redisKey, i, updatedJson);
+                            logger.info("Redis消息内容更新成功: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                            
+                            asyncService.asyncUpdateMessageContentToDb(sessionId, messageUuid, updatedJson);
+                            break;
+                        }
+                    } catch (JsonProcessingException e) {
+                        logger.error("解析Redis消息失败: {}", e.getMessage());
+                    }
+                }
+            } else {
+                logger.warn("Redis中未找到消息: sessionId={}", sessionId);
+            }
+        } catch (Exception e) {
+            logger.error("更新消息内容失败: sessionId={}, messageUuid={}, 错误={}", sessionId, messageUuid, e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public boolean deleteSession(Long sessionId) {
+        logger.info("开始删除会话: sessionId={}", sessionId);
+        
+        try {
+            LambdaQueryWrapper<SessionDetail> queryWrapper = new LambdaQueryWrapper<>();
+            queryWrapper.eq(SessionDetail::getSessionId, sessionId);
+            List<SessionDetail> sessionDetails = sessionDetailMapper.selectList(queryWrapper);
+            
+            for (SessionDetail detail : sessionDetails) {
+                String mediaUrl = detail.getMediaUrl();
+                if (mediaUrl != null && !mediaUrl.isEmpty()) {
+                    try {
+                        String objectName = extractObjectNameFromUrl(mediaUrl);
+                        if (objectName != null) {
+                            ossClient.deleteObject(ossConfig.getBucketName(), objectName);
+                            logger.info("删除OSS文件成功: {}", objectName);
+                        }
+                    } catch (Exception e) {
+                        logger.warn("删除OSS文件失败: {}, 错误={}", mediaUrl, e.getMessage());
+                    }
+                }
+            }
+            
+            sessionDetailMapper.delete(queryWrapper);
+            logger.info("删除MySQL会话详情记录成功: sessionId={}", sessionId);
+            
+            sessionMapper.deleteById(sessionId);
+            logger.info("删除MySQL会话记录成功: sessionId={}", sessionId);
+            
+            String sessionKey = REDIS_KEY_PREFIX + sessionId;
+            String turnKey = REDIS_TURN_COUNT_PREFIX + sessionId;
+            String summaryKey = "session:summary:" + sessionId;
+            String duplicateKey = "memory:duplicate:" + sessionId;
+            
+            redisTemplate.delete(sessionKey);
+            redisTemplate.delete(turnKey);
+            redisTemplate.delete(summaryKey);
+            redisTemplate.delete(duplicateKey);
+            logger.info("删除Redis会话缓存成功: sessionId={}", sessionId);
+            
+            asyncService.asyncDeleteQdrantMemory(sessionId);
+            logger.info("异步删除Qdrant记忆数据: sessionId={}", sessionId);
+            
+            logger.info("会话删除完成: sessionId={}", sessionId);
+            return true;
+        } catch (Exception e) {
+            logger.error("删除会话失败: sessionId={}, 错误={}", sessionId, e.getMessage(), e);
+            return false;
+        }
+    }
+
+    private String extractObjectNameFromUrl(String mediaUrl) {
+        try {
+            String prefix = "https://" + ossConfig.getBucketName() + "." + ossConfig.getEndpoint() + "/";
+            if (mediaUrl.startsWith(prefix)) {
+                return mediaUrl.substring(prefix.length());
+            }
+        } catch (Exception e) {
+            logger.debug("解析OSS URL失败: {}", mediaUrl);
+        }
+        return null;
     }
 }

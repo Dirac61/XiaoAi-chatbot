@@ -1,5 +1,6 @@
 package com.example.xiaoi.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.xiaoi.entity.Session;
 import com.example.xiaoi.entity.SessionDetail;
@@ -59,13 +60,17 @@ public class SessionAsyncService {
      * MySQL 写入相对较慢，异步执行避免阻塞请求线程
      * @param sessionId 会话 ID
      * @param messageJson 消息 JSON 字符串
+     * @param messageType 消息类型：TEXT/IMAGE/FILE/VOICE
+     * @param mediaUrl 媒体文件地址（OSS URL），TEXT和VOICE类型为null
      */
     @Async("summaryExecutor")
-    public void asyncSaveMessageToDb(Long sessionId, String messageJson) {
+    public void asyncSaveMessageToDb(Long sessionId, String messageJson, String messageType, String mediaUrl) {
         try {
             SessionDetail sessionDetail = new SessionDetail();
             sessionDetail.setSessionId(sessionId);
             sessionDetail.setMessages(messageJson);
+            sessionDetail.setMessageType(messageType != null ? messageType : "TEXT");
+            sessionDetail.setMediaUrl(mediaUrl);
             sessionDetail.setCreatedAt(LocalDateTime.now());
             sessionDetail.setUpdatedAt(LocalDateTime.now());
             sessionDetailMapper.insert(sessionDetail);
@@ -164,6 +169,95 @@ public class SessionAsyncService {
             }
         } catch (Exception e) {
             logger.error("异步更新对话摘要失败: sessionId={}, 错误={}", sessionId, e.getMessage());
+        }
+    }
+
+    /**
+     * 异步更新消息内容到 MySQL
+     * 通过消息UUID精确定位消息记录，解析messages字段中的JSON找到匹配的messageUuid
+     * @param sessionId 会话 ID
+     * @param messageUuid 消息唯一标识
+     * @param updatedJson 更新后的消息JSON
+     */
+    @Async("summaryExecutor")
+    public void asyncUpdateMessageContentToDb(Long sessionId, String messageUuid, String updatedJson) {
+        try {
+            LambdaQueryWrapper<SessionDetail> queryWrapper = new LambdaQueryWrapper<>();
+            queryWrapper.eq(SessionDetail::getSessionId, sessionId);
+            queryWrapper.orderByDesc(SessionDetail::getId);
+            
+            java.util.List<SessionDetail> sessionDetails = sessionDetailMapper.selectList(queryWrapper);
+            if (sessionDetails != null && !sessionDetails.isEmpty()) {
+                boolean found = false;
+                for (SessionDetail detail : sessionDetails) {
+                    if (detail.getMessages() != null) {
+                        try {
+                            java.util.Map<String, Object> msg = objectMapper.readValue(detail.getMessages(), 
+                                new com.fasterxml.jackson.core.type.TypeReference<java.util.Map<String, Object>>() {});
+                            String uuid = (String) msg.get("messageUuid");
+                            if (messageUuid.equals(uuid)) {
+                                detail.setMessages(updatedJson);
+                                detail.setUpdatedAt(LocalDateTime.now());
+                                sessionDetailMapper.updateById(detail);
+                                logger.info("MySQL消息内容更新成功: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                                found = true;
+                                break;
+                            }
+                        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+                            logger.debug("解析消息JSON失败: {}", e.getMessage());
+                        }
+                    }
+                }
+                if (!found) {
+                    logger.warn("未找到匹配的消息记录: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                }
+            } else {
+                logger.warn("会话不存在或无消息: sessionId={}", sessionId);
+            }
+        } catch (Exception e) {
+            logger.error("异步更新消息内容到MySQL失败: sessionId={}, messageUuid={}, 错误={}", 
+                sessionId, messageUuid, e.getMessage());
+        }
+    }
+
+    /**
+     * 异步删除 Qdrant 中的记忆数据
+     * 调用 Agent 的删除记忆接口
+     * @param sessionId 会话 ID
+     */
+    @Async("summaryExecutor")
+    public void asyncDeleteQdrantMemory(Long sessionId) {
+        try {
+            Map<String, Object> requestBody = new HashMap<>();
+            requestBody.put("session_id", sessionId);
+            
+            String jsonBody = objectMapper.writeValueAsString(requestBody);
+            String urlStr = agentUrl + "/memory/delete";
+            
+            URL url = new URL(urlStr);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("DELETE");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Accept", "application/json");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(30000);
+            conn.setReadTimeout(60000);
+            
+            try (java.io.OutputStream os = conn.getOutputStream()) {
+                byte[] input = jsonBody.getBytes(StandardCharsets.UTF_8);
+                os.write(input, 0, input.length);
+            }
+            
+            int status = conn.getResponseCode();
+            conn.disconnect();
+            
+            if (status == 200) {
+                logger.info("Qdrant记忆删除成功: sessionId={}", sessionId);
+            } else {
+                logger.warn("Qdrant记忆删除失败: sessionId={}, status={}", sessionId, status);
+            }
+        } catch (Exception e) {
+            logger.error("异步删除Qdrant记忆失败: sessionId={}, 错误={}", sessionId, e.getMessage());
         }
     }
 

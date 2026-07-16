@@ -215,11 +215,11 @@ class MemoryService:
         system_prompt = """你是一个专业的记忆提取助手，负责从用户与AI助手爱尔奎特的对话中提取长期记忆。
 
 【记忆类型定义】
-- FACTS：客观事实、知识、数据、属性（如：用户是程序员、身高180cm）
-- PREFERENCES：用户偏好、喜好、厌恶、习惯（如：喜欢川菜、讨厌香菜）
-- ENTITY：重要实体、人物、地点、事物（如：父母、北京、iPhone）
+- FACTS：客观事实、知识、数据、属性（如：用户是程序员、身高180cm、图片中的文字内容）
+- PREFERENCES：用户偏好、喜好、厌恶、习惯（如：喜欢川菜、讨厌香菜、喜欢猫）
+- ENTITY：重要实体、人物、地点、事物（如：父母、北京、iPhone、图片中的关键对象）
 - RELATION：实体之间的关系（如：用户是小明的同事、公司在上海）
-- EVENT：事件、经历、计划、目标（如：下周去旅游、昨天看电影）
+- EVENT：事件、经历、计划、目标（如：下周去旅游、昨天看电影、图片中的场景）
 - NEEDS：用户需求、意图、问题、关注点（如：用户想了解微信、用户有问题要问）
 
 【提取规则】
@@ -232,6 +232,8 @@ class MemoryService:
 4. 实体提取：列出记忆内容中涉及的关键名词，用中文，不超过5个
 5. 以下情况也要提取：用户提到的事物、表达的兴趣、提出的问题、表达的情感
 6. 只有纯问候语（如"你好"、"再见"）才输出空数组
+7. 对话中标注为[图片内容]的部分代表用户上传图片的视觉信息，应提取为FACTS或ENTITY类型记忆
+8. 从图片中提取的信息包括：图片中的文字内容、图片描述的对象/场景、图片展示的关键信息
 
 【高质量记忆示例】
 
@@ -248,15 +250,38 @@ Assistant: 原来如此，Java后端开发是个不错的职业呢，川菜确�
 
 示例2：
 对话内容：
-User: 微信是什么？
-Assistant: 微信是一款非常流行的社交软件
+User: [用户提问]这张照片里是什么？[图片内容]图片显示一只白色的猫坐在沙发上，背景是灰色的墙壁，猫看起来很放松
+Assistant: 这是一只白色的猫咪，看起来很可爱
 
 提取结果：
 [
-  {"content": "用户询问微信是什么", "type": "NEEDS", "importance_score": 0.6, "entities": ["微信"]}
+  {"content": "用户上传了一张白色猫咪坐在沙发上的照片", "type": "FACTS", "importance_score": 0.6, "entities": ["猫咪", "沙发"]},
+  {"content": "用户可能喜欢猫", "type": "PREFERENCES", "importance_score": 0.55, "entities": ["猫"]}
 ]
 
 示例3：
+对话内容：
+User: [用户提问]帮我看看这段代码有什么问题？[图片内容]图片显示一段Python代码，定义了一个名为calculate的函数，使用了Java的语法结构，有语法错误
+Assistant: 这段代码使用了Java的语法写Python，需要修改
+
+提取结果：
+[
+  {"content": "用户正在学习Python编程", "type": "FACTS", "importance_score": 0.7, "entities": ["Python", "编程"]},
+  {"content": "用户遇到了Python代码语法错误", "type": "NEEDS", "importance_score": 0.65, "entities": ["代码", "语法"]}
+]
+
+示例4：
+对话内容：
+User: [用户提问]这是我家的风景照[图片内容]图片显示一片美丽的海滩，蓝色的大海和白色的沙滩，远处有椰子树
+Assistant: 你的家乡风景真美
+
+提取结果：
+[
+  {"content": "用户家乡有美丽的海滩风景", "type": "FACTS", "importance_score": 0.75, "entities": ["海滩", "家乡"]},
+  {"content": "用户喜欢海滩风景", "type": "PREFERENCES", "importance_score": 0.5, "entities": ["海滩"]}
+]
+
+示例5：
 对话内容：
 User: 我下周要去杭州旅游，和女朋友小红一起
 Assistant: 杭州是个很美的城市，祝你们玩得开心
@@ -267,17 +292,7 @@ Assistant: 杭州是个很美的城市，祝你们玩得开心
   {"content": "用户的女朋友叫小红", "type": "ENTITY", "importance_score": 0.8, "entities": ["小红"]}
 ]
 
-示例4：
-对话内容：
-User: 我觉得这个电影很好看
-Assistant: 看来你很喜欢这部电影呢
-
-提取结果：
-[
-  {"content": "用户认为某部电影很好看", "type": "PREFERENCES", "importance_score": 0.5, "entities": ["电影"]}
-]
-
-示例5：
+示例6：
 对话内容：
 User: 你好
 Assistant: 你好
