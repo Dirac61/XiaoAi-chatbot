@@ -39,9 +39,11 @@ public interface SessionService {
      * 保存消息到 Redis 和 MySQL
      * Redis 同步写入（毫秒级），MySQL 通过 @Async 异步写入
      * @param sessionId 会话 ID
-     * @param message 消息内容（包含 role、content、timestamp）
+     * @param message 消息内容（包含 role、content、timestamp、messageType、mediaUrl）
+     * @param messageType 消息类型：TEXT/IMAGE/FILE/VOICE
+     * @param mediaUrl 媒体文件地址（OSS URL），TEXT和VOICE类型为null
      */
-    void saveMessage(Long sessionId, Map<String, Object> message);
+    void saveMessage(Long sessionId, Map<String, Object> message, String messageType, String mediaUrl);
 
     /**
      * 分页获取会话消息（从 MySQL 读取）
@@ -59,4 +61,22 @@ public interface SessionService {
      * @return 消息总数
      */
     Long getTotalMessageCount(Long sessionId);
+
+    /**
+     * 更新消息内容（用于多模态消息异步提取文本后回写）
+     * 通过消息UUID查找并更新消息的content字段，将用户提问和提取信息一起结构化存储
+     * @param sessionId 会话 ID
+     * @param messageUuid 消息唯一标识（UUID格式）
+     * @param message 用户原始提问
+     * @param extractedText 提取后的文本内容
+     */
+    void updateMessageContent(Long sessionId, String messageUuid, String message, String extractedText);
+
+    /**
+     * 删除会话及所有相关数据
+     * 删除内容包括：MySQL中的session和session_detail记录、Redis中的会话缓存、OSS中的媒体文件、Qdrant中的记忆数据
+     * @param sessionId 会话 ID
+     * @return 删除是否成功
+     */
+    boolean deleteSession(Long sessionId);
 }

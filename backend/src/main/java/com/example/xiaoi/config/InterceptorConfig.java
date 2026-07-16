@@ -25,7 +25,7 @@ public class InterceptorConfig implements WebMvcConfigurer {
         registry.addInterceptor(tokenInterceptor)
                 // 拦截所有 /api/** 请求
                 .addPathPatterns("/api/**")
-                // 排除登录接口（无需登录即可访问）和健康检查接口
-                .excludePathPatterns("/api/login", "/api/health");
+                // 排除登录接口、健康检查接口和内部接口（Agent调用）
+                .excludePathPatterns("/api/login", "/api/health", "/api/message/update-content", "/api/session/delete/**");
     }
 }

@@ -133,4 +133,27 @@ public class SessionController {
         
         return result;
     }
+
+    /**
+     * 删除会话及所有相关数据
+     * 删除内容包括：MySQL中的session和session_detail记录、Redis中的会话缓存、OSS中的媒体文件、Qdrant中的记忆数据
+     * @param sessionId 会话 ID
+     * @return 删除结果
+     */
+    @DeleteMapping("/session/delete/{sessionId}")
+    public Map<String, Object> deleteSession(@PathVariable("sessionId") Long sessionId) {
+        Map<String, Object> result = new HashMap<>();
+        
+        boolean success = sessionService.deleteSession(sessionId);
+        
+        if (success) {
+            result.put("code", 200);
+            result.put("message", "删除成功");
+        } else {
+            result.put("code", 500);
+            result.put("message", "删除失败");
+        }
+        
+        return result;
+    }
 }
