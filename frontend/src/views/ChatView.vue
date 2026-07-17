@@ -1,10 +1,20 @@
-<script setup>import { nextTick, onMounted, ref } from 'vue';
+<script setup>import { nextTick, onMounted, ref, reactive, watch } from 'vue';
 import { useRouter } from 'vue-router';
 const router = useRouter();
 const currentUser = ref('');
 const messages = ref([
  { type: 'system', content: '欢迎使用小爱，发送消息开始聊天' }
 ]);
+watch(messages, () => {
+ nextTick(() => {
+ const container = chatContainer.value;
+ if (container) {
+ setTimeout(() => {
+ container.scrollTop = container.scrollHeight;
+ }, 30);
+ }
+ });
+}, { deep: true });
 const inputMessage = ref('');
 const isLoading = ref(false);
 const isLoadingMore = ref(false);
@@ -25,6 +35,31 @@ const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const showDeleteConfirm = ref(false);
 const sessionToDelete = ref(null);
+const expandedExtracted = reactive({});
+const previewImage = ref(null);
+const imageLoaded = () => {
+ setTimeout(() => {
+ const container = chatContainer.value;
+ if (container) {
+ container.scrollTop = container.scrollHeight;
+ }
+ }, 50);
+};
+const ensureScrollToBottom = () => {
+ const container = chatContainer.value;
+ if (!container)
+ return;
+ const lastMessage = container.querySelector('.message:last-child');
+ if (lastMessage) {
+ const observer = new IntersectionObserver((entries) => {
+ if (!entries[0].isIntersecting) {
+ container.scrollTop = container.scrollHeight;
+ }
+ observer.disconnect();
+ }, { root: container, threshold: 0.9 });
+ observer.observe(lastMessage);
+ }
+};
 onMounted(async () => {
  const token = localStorage.getItem('token');
  const username = localStorage.getItem('username');
@@ -78,6 +113,25 @@ const createNewSession = async () => {
  console.error('创建会话失败:', error);
  }
 };
+const scrollToBottom = () => {
+ const doScroll = () => {
+ const container = chatContainer.value;
+ if (container) {
+ container.scrollTop = container.scrollHeight;
+ }
+ };
+ nextTick(() => {
+ doScroll();
+ requestAnimationFrame(() => {
+ doScroll();
+ requestAnimationFrame(() => {
+ doScroll();
+ });
+ });
+ setTimeout(doScroll, 100);
+ setTimeout(doScroll, 300);
+ });
+};
 const loadMessages = async (page = 1) => {
  if (!currentSessionId.value || isLoadingMore.value)
  return;
@@ -121,7 +175,10 @@ const loadMessages = async (page = 1) => {
  }
  finally {
  isLoadingMore.value = false;
- if (page > 1 && container) {
+ if (page === 1) {
+ scrollToBottom();
+ }
+ else if (page > 1 && container) {
  nextTick(() => {
  container.scrollTop = (container.scrollHeight - oldScrollHeight) + oldScrollTop;
  });
@@ -133,6 +190,33 @@ const selectSession = async (session) => {
  pageNum.value = 1;
  hasMore.value = true;
  await loadMessages(1);
+ nextTick(() => {
+ ensureScrollToBottom();
+ setTimeout(() => {
+ const container = chatContainer.value;
+ if (container) {
+ container.scrollTop = container.scrollHeight;
+ }
+ }, 50);
+ setTimeout(() => {
+ const container = chatContainer.value;
+ if (container) {
+ container.scrollTop = container.scrollHeight;
+ }
+ }, 150);
+ setTimeout(() => {
+ const container = chatContainer.value;
+ if (container) {
+ container.scrollTop = container.scrollHeight;
+ }
+ }, 300);
+ setTimeout(() => {
+ const container = chatContainer.value;
+ if (container) {
+ container.scrollTop = container.scrollHeight;
+ }
+ }, 500);
+ });
 };
 const handleScroll = async () => {
  const container = chatContainer.value;
@@ -190,6 +274,20 @@ const deleteSession = async () => {
  sessionToDelete.value = null;
  }
 };
+const toggleExtracted = (index) => {
+ if (expandedExtracted[index]) {
+ delete expandedExtracted[index];
+ }
+ else {
+ expandedExtracted[index] = true;
+ }
+};
+const openImagePreview = (url) => {
+ previewImage.value = url;
+};
+const closeImagePreview = () => {
+ previewImage.value = null;
+};
 const sendMessage = async () => {
  const hasPending = pendingMedia.value !== null;
  const textContent = inputMessage.value.trim();
@@ -217,6 +315,7 @@ const sendMessage = async () => {
  });
  const botMessageIndex = messages.value.push({ type: 'bot', content: '' }) - 1;
  isLoading.value = true;
+ scrollToBottom();
  try {
  const token = localStorage.getItem('token');
  const response = await fetch('/api/chat', {
@@ -252,6 +351,7 @@ const sendMessage = async () => {
  if (done)
  break;
  messages.value[botMessageIndex].content += decoder.decode(value, { stream: true });
+ scrollToBottom();
  }
  }
  catch (error) {
@@ -295,7 +395,22 @@ const uploadFile = async (type, file) => {
  alert('上传失败');
  }
 };
-const removePendingMedia = () => {
+const removePendingMedia = async () => {
+ if (pendingMedia.value && pendingMedia.value.url) {
+ try {
+ const token = localStorage.getItem('token');
+ await fetch('/api/upload/delete', {
+ method: 'DELETE',
+ headers: {
+ 'Content-Type': 'application/json',
+ 'Authorization': token || ''
+ },
+ body: JSON.stringify({ url: pendingMedia.value.url })
+ });
+ } catch (error) {
+ console.error('删除待上传文件失败:', error);
+ }
+ }
  pendingMedia.value = null;
 };
 const handleImageUpload = (event) => {
@@ -511,8 +626,15 @@ const processAudio = async (audioBlob) => {
               
               <template v-else-if="msg.type === 'user'">
                 <div v-if="msg.messageType === 'IMAGE' && msg.mediaUrl" class="media-section">
-                  <div class="image-wrapper">
-                    <img :src="msg.mediaUrl" alt="图片" class="message-image" />
+                  <div class="image-wrapper" @click="openImagePreview(msg.mediaUrl)">
+                    <img :src="msg.mediaUrl" alt="图片" class="message-image" @load="imageLoaded" />
+                    <div class="image-overlay">
+                      <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="white" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"/>
+                        <path d="M15 12l3.09-3.09a1.5 1.5 0 0 1 2.12 2.12L12 15"/>
+                        <path d="M9 12l-3.09 3.09a1.5 1.5 0 0 1-2.12-2.12L12 9"/>
+                      </svg>
+                    </div>
                   </div>
                 </div>
                 <div v-if="msg.messageType === 'FILE' && msg.mediaUrl" class="media-section">
@@ -524,10 +646,22 @@ const processAudio = async (audioBlob) => {
                   </a>
                 </div>
                 <span v-if="msg.content" class="message-text">{{ msg.content }}</span>
-                <span v-if="msg.extractedText" class="extracted-text">
-                  <span class="extracted-label">【提取内容】</span>
-                  <span class="extracted-content">{{ msg.extractedText }}</span>
-                </span>
+                <div v-if="msg.extractedText" class="extracted-container">
+                  <button class="extracted-toggle" @click="toggleExtracted(index)">
+                    <svg v-if="!expandedExtracted[index]" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="12 5 12 19"/>
+                      <polyline points="5 12 19 12"/>
+                    </svg>
+                    <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <line x1="5" y1="12" x2="19" y2="12"/>
+                    </svg>
+                    <span>{{ expandedExtracted[index] ? '收起提取内容' : '查看提取内容' }}</span>
+                  </button>
+                  <div v-if="expandedExtracted[index]" class="extracted-content-box">
+                    <span class="extracted-label">【提取内容】</span>
+                    <span class="extracted-text">{{ msg.extractedText }}</span>
+                  </div>
+                </div>
               </template>
 
               <template v-else>
@@ -549,17 +683,42 @@ const processAudio = async (audioBlob) => {
 
           <div class="chat-input">
             <div class="input-tools">
-              <input type="file" accept="image/*" class="tool-input" id="image-input" @change="handleImageUpload" />
-              <label for="image-input" class="tool-btn" :class="{ disabled: isLoading }">🖼️</label>
+              <div class="tool-btn-wrapper">
+                <input type="file" accept="image/*" class="tool-input" id="image-input" @change="handleImageUpload" />
+                <label for="image-input" class="tool-btn" :class="{ disabled: isLoading }">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                    <circle cx="8.5" cy="8.5" r="1.5"/>
+                    <polyline points="21 15 16 10 5 21"/>
+                  </svg>
+                </label>
+              </div>
 
-              <input type="file" class="tool-input" id="file-input" @change="handleFileUpload" />
-              <label for="file-input" class="tool-btn" :class="{ disabled: isLoading }">📎</label>
+              <div class="tool-btn-wrapper">
+                <input type="file" class="tool-input" id="file-input" @change="handleFileUpload" />
+                <label for="file-input" class="tool-btn" :class="{ disabled: isLoading }">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                  </svg>
+                </label>
+              </div>
 
-              <button class="tool-btn" :class="{ recording: isRecording }" :disabled="isLoading"
-                @click="isRecording ? stopRecording() : startRecording()">
-                {{ isRecording ? '⏹️' : '🎤' }}
-              </button>
-              <span v-if="isRecording" class="recording-time">{{ recordingTime }}s</span>
+              <div class="tool-btn-wrapper">
+                <button class="tool-btn" :class="{ recording: isRecording }" :disabled="isLoading"
+                  @click="isRecording ? stopRecording() : startRecording()">
+                  <svg v-if="!isRecording" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                    <path d="M19 9v6a2 2 0 0 1-2 2h-2"/>
+                  </svg>
+                  <svg v-else viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="6" y="4" width="4" height="16"/>
+                    <rect x="14" y="4" width="4" height="16"/>
+                  </svg>
+                </button>
+                <span v-if="isRecording" class="recording-time">{{ recordingTime }}s</span>
+              </div>
             </div>
             <input type="text" v-model="inputMessage" placeholder="输入消息..." class="input-field"
               @keyup.enter="sendMessage()" :disabled="isLoading" />
@@ -585,6 +744,13 @@ const processAudio = async (audioBlob) => {
         </div>
       </div>
     </div>
+
+    <div v-if="previewImage" class="image-preview-modal" @click="closeImagePreview">
+      <div class="preview-content" @click.stop>
+        <button class="preview-close" @click="closeImagePreview">✕</button>
+        <img :src="previewImage" alt="预览" class="preview-image" />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -594,7 +760,7 @@ const processAudio = async (audioBlob) => {
   flex-direction: column;
   height: 100vh;
   width: 100%;
-  background-color: #f0f2f5;
+  background-color: #f5f7fa;
 }
 
 .chat-header {
@@ -602,9 +768,9 @@ const processAudio = async (audioBlob) => {
   justify-content: space-between;
   align-items: center;
   padding: 16px 24px;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   color: white;
-  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+  box-shadow: 0 4px 20px rgba(99, 102, 241, 0.3);
   position: relative;
   z-index: 10;
 }
@@ -616,91 +782,97 @@ const processAudio = async (audioBlob) => {
   color: white;
   font-size: 20px;
   cursor: pointer;
-  padding: 6px 10px;
-  border-radius: 6px;
-  transition: background 0.2s;
+  padding: 6px 12px;
+  border-radius: 8px;
+  transition: all 0.2s;
 }
-.sidebar-toggle:hover { background: rgba(255, 255, 255, 0.25); }
-.logo { font-size: 28px; }
-.title { font-size: 20px; font-weight: 700; letter-spacing: 1px; }
+.sidebar-toggle:hover { background: rgba(255, 255, 255, 0.25); transform: scale(1.05); }
+.logo { font-size: 32px; }
+.title { font-size: 22px; font-weight: 700; letter-spacing: 2px; }
 
 .header-right { display: flex; align-items: center; gap: 16px; }
-.username { font-size: 14px; opacity: 0.9; background: rgba(255, 255, 255, 0.15); padding: 4px 12px; border-radius: 12px; }
+.username { font-size: 14px; opacity: 0.9; background: rgba(255, 255, 255, 0.15); padding: 6px 14px; border-radius: 20px; font-weight: 500; }
 
 .logout-btn {
   background: rgba(255, 255, 255, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.3);
   color: white;
-  padding: 6px 16px;
+  padding: 8px 20px;
   border-radius: 20px;
   font-size: 14px;
   cursor: pointer;
   transition: all 0.3s;
 }
-.logout-btn:hover { background: rgba(255, 255, 255, 0.3); transform: translateY(-1px); }
+.logout-btn:hover { 
+  background: rgba(255, 255, 255, 0.3); 
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(255, 255, 255, 0.2);
+}
 
 .chat-body { flex: 1; display: flex; overflow: hidden; }
 
 .sidebar {
-  width: 260px;
+  width: 280px;
   background-color: white;
-  border-right: 1px solid #e8e8e8;
+  border-right: 1px solid #e2e8f0;
   display: flex;
   flex-direction: column;
-  transition: all 0.3s ease;
-  box-shadow: 2px 0 8px rgba(0, 0, 0, 0.05);
+  transition: all 0.35s ease;
+  box-shadow: 4px 0 20px rgba(0, 0, 0, 0.04);
 }
-.sidebar.closed { width: 64px; }
-.sidebar-header { padding: 16px; border-bottom: 1px solid #f0f0f0; }
-.sidebar.closed .sidebar-header { padding: 16px 8px; }
+.sidebar.closed { width: 72px; }
+.sidebar-header { padding: 20px; border-bottom: 1px solid #f1f5f9; }
+.sidebar.closed .sidebar-header { padding: 20px 12px; }
 
 .new-session-btn {
   width: 100%;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   color: white;
   border: none;
-  padding: 12px 16px;
-  border-radius: 10px;
+  padding: 14px 16px;
+  border-radius: 12px;
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
   transition: all 0.3s;
-  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
 }
 .new-session-btn:hover { 
-  opacity: 0.9; 
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+  opacity: 0.95; 
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(99, 102, 241, 0.45);
 }
 
-.session-list { flex: 1; overflow-y: auto; padding: 8px; }
+.session-list { flex: 1; overflow-y: auto; padding: 12px; }
 .session-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 12px;
-  border-radius: 10px;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.25s;
   position: relative;
+  margin-bottom: 6px;
 }
 .session-item:hover { 
-  background-color: #f5f7fa;
-  transform: translateX(2px);
+  background-color: #f8fafc;
+  transform: translateX(4px);
 }
 .session-item.active { 
-  background-color: #e8f0fe;
-  box-shadow: 0 2px 4px rgba(64, 158, 255, 0.15);
+  background: linear-gradient(135deg, #e0e7ff 0%, #ddd6fe 100%);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.15);
 }
-.sidebar.closed .session-item { justify-content: center; padding: 12px 8px; }
-.session-icon { font-size: 18px; }
+.sidebar.closed .session-item { justify-content: center; padding: 14px 8px; }
+.session-icon { font-size: 20px; }
 .session-title {
   flex: 1;
   font-size: 14px;
-  color: #333;
+  color: #334155;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 500;
 }
 .sidebar.closed .session-title { display: none; }
 
@@ -709,10 +881,10 @@ const processAudio = async (audioBlob) => {
   visibility: hidden;
   background: none;
   border: none;
-  color: #999;
+  color: #94a3b8;
   cursor: pointer;
-  padding: 4px;
-  border-radius: 4px;
+  padding: 6px;
+  border-radius: 6px;
   transition: all 0.2s;
 }
 .session-item:hover .session-delete {
@@ -720,8 +892,8 @@ const processAudio = async (audioBlob) => {
   visibility: visible;
 }
 .session-delete:hover {
-  color: #f56c6c;
-  background-color: #fef0f0;
+  color: #ef4444;
+  background-color: #fef2f2;
 }
 .sidebar.closed .session-delete { display: none; }
 
@@ -732,148 +904,202 @@ const processAudio = async (audioBlob) => {
   background-color: #f5f7fa;
 }
 
-.loading-more { text-align: center; padding: 10px; color: #999; font-size: 14px; }
+.loading-more { text-align: center; padding: 12px; color: #94a3b8; font-size: 14px; }
 .chat-messages { flex: 1; padding: 24px; overflow-y: auto; }
 
-.message { margin-bottom: 20px; display: flex; }
+.message { margin-bottom: 24px; display: flex; }
 .message.user { justify-content: flex-end; }
 .message.user .message-bubble {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   color: white;
-  border-radius: 18px 18px 4px 18px;
+  border-radius: 20px 20px 6px 20px;
 }
 .message.user .file-card {
   background: rgba(255, 255, 255, 0.15);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.25);
 }
 .message.user .file-name { color: white; }
 .message.user .file-icon { background: rgba(255, 255, 255, 0.2); }
-.message.user .extracted-text {
+.message.user .extracted-toggle {
+  background: rgba(255, 255, 255, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: rgba(255, 255, 255, 0.9);
+}
+.message.user .extracted-toggle:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+.message.user .extracted-content-box {
   background: rgba(255, 255, 255, 0.1);
   border: 1px solid rgba(255, 255, 255, 0.15);
 }
 .message.user .extracted-label { color: rgba(255, 255, 255, 0.8); }
-.message.user .extracted-content { color: white; }
+.message.user .extracted-text { color: white; }
 .message.bot .message-bubble {
   background-color: white;
-  color: #333;
-  border-radius: 18px 18px 18px 4px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  color: #334155;
+  border-radius: 20px 20px 20px 6px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
 }
 .message.system .message-bubble {
-  background-color: #f0f0f0;
-  color: #666;
-  border-radius: 8px;
+  background-color: #f1f5f9;
+  color: #64748b;
+  border-radius: 10px;
   text-align: center;
 }
 .message-bubble {
-  max-width: 70%;
-  padding: 14px 18px;
+  max-width: 68%;
+  padding: 16px 20px;
   font-size: 15px;
-  line-height: 1.6;
+  line-height: 1.7;
 }
 
 .system-message {
   font-size: 13px;
-  color: #999;
+  color: #94a3b8;
 }
 
 .media-section {
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 
 .image-wrapper {
-  border-radius: 10px;
+  border-radius: 12px;
   overflow: hidden;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-  max-width: 300px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+  max-width: 320px;
+  cursor: zoom-in;
+  position: relative;
+  transition: all 0.3s;
+}
+.image-wrapper:hover {
+  transform: scale(1.02);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
 }
 .message-image {
   max-width: 100%;
-  max-height: 300px;
+  max-height: 320px;
   display: block;
   object-fit: cover;
+}
+.image-overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(to top, rgba(0,0,0,0.6), transparent);
+  padding: 20px;
+  display: flex;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.image-wrapper:hover .image-overlay {
+  opacity: 1;
 }
 
 .file-card {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 16px;
-  background: #f5f7fa;
-  border-radius: 10px;
+  padding: 14px 16px;
+  background: #f8fafc;
+  border-radius: 12px;
   text-decoration: none;
-  transition: all 0.2s;
-  border: 1px solid #e8e8e8;
+  transition: all 0.25s;
+  border: 1px solid #e2e8f0;
 }
 .file-card:hover {
-  background: #e8f0fe;
-  border-color: #409eff;
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(64, 158, 255, 0.15);
+  background: #e0e7ff;
+  border-color: #6366f1;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 16px rgba(99, 102, 241, 0.15);
 }
 .file-icon {
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #e8f0fe;
-  border-radius: 8px;
-  font-size: 20px;
+  background: #e0e7ff;
+  border-radius: 10px;
+  font-size: 22px;
 }
 .file-info { flex: 1; }
 .file-name {
   font-size: 14px;
-  color: #333;
+  color: #334155;
   font-weight: 500;
 }
 
 .message-text { display: block; word-break: break-all; }
 
-.extracted-text { 
-  display: block; 
-  margin: 10px 0 0 0; 
-  padding: 10px 14px; 
-  background-color: #f5f7fa; 
-  border-radius: 8px; 
-  font-size: 13px; 
-  line-height: 1.6; 
-  border: 1px solid #e8e8e8;
+.extracted-container {
+  margin-top: 12px;
+}
+.extracted-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #64748b;
+  transition: all 0.2s;
+}
+.extracted-toggle:hover {
+  background: #e2e8f0;
+  color: #334155;
+}
+.extracted-content-box {
+  margin-top: 8px;
+  padding: 14px;
+  background-color: #f8fafc;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  animation: fadeIn 0.2s;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 .extracted-label { 
-  color: #666; 
+  color: #64748b; 
   font-weight: 600; 
   display: block; 
-  margin-bottom: 4px; 
+  margin-bottom: 6px; 
   font-size: 12px;
 }
-.extracted-content { 
-  color: #444; 
+.extracted-text { 
+  color: #475569; 
   word-break: break-all; 
+  font-size: 14px;
+  line-height: 1.7;
 }
 
 .chat-input-area {
   background-color: white;
-  box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.06);
 }
 
 .pending-preview {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 24px 0 24px;
+  padding: 12px 24px 0 24px;
   font-size: 13px;
 }
 .pending-label {
-  background-color: #e8f0fe;
-  color: #409eff;
-  padding: 6px 12px;
-  border-radius: 14px;
+  background-color: #e0e7ff;
+  color: #6366f1;
+  padding: 8px 14px;
+  border-radius: 16px;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  max-width: 250px;
+  gap: 8px;
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -882,109 +1108,115 @@ const processAudio = async (audioBlob) => {
 .pending-remove {
   background: none;
   border: none;
-  color: #999;
+  color: #94a3b8;
   cursor: pointer;
-  font-size: 16px;
-  padding: 2px;
+  font-size: 18px;
+  padding: 4px;
   line-height: 1;
-  border-radius: 4px;
+  border-radius: 6px;
   transition: all 0.2s;
 }
 .pending-remove:hover { 
-  color: #f56c6c; 
-  background-color: #fef0f0;
+  color: #ef4444; 
+  background-color: #fef2f2;
 }
 
 .chat-input {
-  padding: 12px 24px 18px 24px;
+  padding: 16px 24px;
   display: flex;
   gap: 12px;
   align-items: center;
 }
 
-.input-tools { display: flex; align-items: center; gap: 6px; }
+.input-tools { display: flex; align-items: center; gap: 8px; }
 .tool-input { display: none; }
+.tool-btn-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
 
 .tool-btn {
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   border: none;
-  background-color: #f5f7fa;
-  border-radius: 8px;
+  background-color: #f1f5f9;
+  border-radius: 12px;
   cursor: pointer;
-  font-size: 20px;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.2s;
+  transition: all 0.25s;
+  color: #64748b;
 }
 .tool-btn:hover:not(.disabled):not(:disabled) { 
-  background-color: #e4e7ed;
-  transform: translateY(-1px);
+  background-color: #e0e7ff;
+  color: #6366f1;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.15);
 }
 .tool-btn.disabled, .tool-btn:disabled { 
-  opacity: 0.5; 
+  opacity: 0.4; 
   cursor: not-allowed; 
 }
 .tool-btn.recording {
-  background-color: #f56c6c;
+  background-color: #ef4444;
   color: white;
   animation: pulse 1s infinite;
 }
 
 @keyframes pulse {
-  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(245, 108, 108, 0.4); }
-  50% { transform: scale(1.05); box-shadow: 0 0 0 6px rgba(245, 108, 108, 0); }
-  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(245, 108, 108, 0); }
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { transform: scale(1.05); box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
 }
 
 .recording-time { 
   font-size: 12px; 
-  color: #f56c6c; 
+  color: #ef4444; 
   white-space: nowrap;
   font-weight: 600;
-  margin-left: 4px;
 }
 
 .input-field {
   flex: 1;
-  padding: 14px 18px;
-  border: 1px solid #e8e8e8;
-  border-radius: 12px;
+  padding: 14px 20px;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 16px;
   font-size: 15px;
   background-color: #fafafa;
-  transition: all 0.2s;
+  transition: all 0.25s;
 }
 .input-field:focus { 
   outline: none; 
-  border-color: #667eea; 
+  border-color: #6366f1; 
   background-color: white;
-  box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+  box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.1);
 }
 .input-field:disabled { 
-  background-color: #f0f0f0; 
-  color: #999;
+  background-color: #f1f5f9; 
+  color: #94a3b8;
 }
 
 .send-btn {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   color: white;
   border: none;
-  padding: 14px 28px;
-  border-radius: 12px;
+  padding: 14px 32px;
+  border-radius: 16px;
   cursor: pointer;
   font-size: 15px;
-  font-weight: 500;
+  font-weight: 600;
   transition: all 0.3s;
-  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
 }
 .send-btn:hover:not(:disabled) { 
-  opacity: 0.9; 
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+  opacity: 0.95; 
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(99, 102, 241, 0.45);
 }
 .send-btn:disabled { 
-  opacity: 0.6; 
+  opacity: 0.5; 
   cursor: not-allowed; 
 }
 
@@ -1009,11 +1241,11 @@ const processAudio = async (audioBlob) => {
 
 .modal-content {
   background: white;
-  border-radius: 16px;
-  width: 400px;
+  border-radius: 20px;
+  width: 420px;
   max-width: 90%;
   overflow: hidden;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
   animation: slideUp 0.3s;
 }
 
@@ -1023,13 +1255,13 @@ const processAudio = async (audioBlob) => {
 }
 
 .modal-header {
-  padding: 20px 24px;
-  border-bottom: 1px solid #f0f0f0;
+  padding: 24px;
+  border-bottom: 1px solid #f1f5f9;
 }
 .modal-header h3 {
   margin: 0;
-  font-size: 18px;
-  color: #333;
+  font-size: 20px;
+  color: #1e293b;
 }
 
 .modal-body {
@@ -1037,47 +1269,100 @@ const processAudio = async (audioBlob) => {
 }
 .modal-body p {
   margin: 0;
-  color: #666;
+  color: #64748b;
   font-size: 15px;
-  line-height: 1.6;
+  line-height: 1.7;
 }
 
 .modal-footer {
-  padding: 16px 24px;
-  border-top: 1px solid #f0f0f0;
+  padding: 20px 24px;
+  border-top: 1px solid #f1f5f9;
   display: flex;
   justify-content: flex-end;
   gap: 12px;
 }
 
 .btn-cancel {
-  padding: 10px 24px;
-  border: 1px solid #d9d9d9;
-  border-radius: 8px;
+  padding: 12px 28px;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 12px;
   background: white;
-  color: #666;
-  font-size: 14px;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-.btn-cancel:hover {
-  background: #f5f5f5;
-  border-color: #ccc;
-}
-
-.btn-confirm {
-  padding: 10px 24px;
-  border: none;
-  border-radius: 8px;
-  background: linear-gradient(135deg, #f56c6c 0%, #ee4d4d 100%);
-  color: white;
+  color: #64748b;
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.25s;
+}
+.btn-cancel:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+.btn-confirm {
+  padding: 12px 28px;
+  border: none;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+  color: white;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.25s;
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
 }
 .btn-confirm:hover {
-  opacity: 0.9;
-  transform: translateY(-1px);
+  opacity: 0.95;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(239, 68, 68, 0.4);
+}
+
+.image-preview-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  animation: fadeIn 0.2s;
+}
+
+.preview-content {
+  position: relative;
+  max-width: 90%;
+  max-height: 90%;
+  padding: 20px;
+}
+
+.preview-close {
+  position: absolute;
+  top: -40px;
+  right: 0;
+  background: rgba(255, 255, 255, 0.2);
+  border: none;
+  color: white;
+  font-size: 28px;
+  cursor: pointer;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+.preview-close:hover {
+  background: rgba(255, 255, 255, 0.3);
+  transform: scale(1.1);
+}
+
+.preview-image {
+  max-width: 100%;
+  max-height: 80vh;
+  border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
 </style>

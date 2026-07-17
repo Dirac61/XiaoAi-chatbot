@@ -58,4 +58,24 @@ public class OSSUploadService {
     public String uploadFile(MultipartFile file) throws IOException {
         return uploadFile(file, "files");
     }
+
+    public boolean deleteFile(String url) {
+        try {
+            String endpoint = ossConfig.getEndpoint();
+            String bucketName = ossConfig.getBucketName();
+            
+            if (url != null && url.contains(endpoint)) {
+                String objectName = url.substring(url.indexOf(endpoint) + endpoint.length() + 1);
+                ossClient.deleteObject(bucketName, objectName);
+                logger.info("文件删除成功: {}", url);
+                return true;
+            } else {
+                logger.warn("无效的文件URL: {}", url);
+                return false;
+            }
+        } catch (Exception e) {
+            logger.error("文件删除失败: {}", e.getMessage());
+            return false;
+        }
+    }
 }
