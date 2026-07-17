@@ -334,7 +334,7 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
     logger.info(f"=== 提取条件检查 ===")
     logger.info(f"message_type: '{message_type}'")
     logger.info(f"is_multimodal: {is_multimodal}")
-    logger.info(f"media_url: '{media_url[:50]}...'")
+    logger.info(f"media_url: '{media_url[:50]}...'" if media_url else "media_url: None")
     logger.info(f"media_url is None: {media_url is None}")
     logger.info(f"提取条件: is_multimodal={is_multimodal}, media_url存在={media_url is not None}")
     
@@ -343,7 +343,7 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         extracted_text = await extract_media_text(media_url, message_type)
         logger.info(f"=== 提取结果确认 ===")
         logger.info(f"extract_media_text返回值类型: {type(extracted_text)}")
-        logger.info(f"extract_media_text返回值: '{extracted_text[:100]}...'")
+        logger.info(f"extract_media_text返回值: '{extracted_text[:100]}...'" if extracted_text else "extract_media_text返回值: None")
         logger.info(f"extract_media_text返回值长度: {len(extracted_text) if extracted_text else 0}")
         if extracted_text:
             logger.info(f"{message_type}文本提取成功，长度: {len(extracted_text)}字符")
@@ -356,7 +356,7 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
             if extracted_text:
                 search_query = f"{message} {extracted_text}"
             else:
-                search_query = message if message_type in ("TEXT", "VOICE") else f"{message} {media_url}"
+                search_query = message if message_type in ("TEXT", "VOICE") else (f"{message} {media_url}" if media_url else message)
             memories = await memory_service.search_memories(search_query, session_id, top_k=5)
         except Exception as e:
             logger.error(f"记忆检索失败: {e}")

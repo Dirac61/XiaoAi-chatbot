@@ -324,4 +324,35 @@ public class ChatController {
             return ResponseEntity.internalServerError().body(result);
         }
     }
+
+    @DeleteMapping("/upload/delete")
+    public ResponseEntity<Map<String, Object>> deleteFile(@RequestBody Map<String, Object> request) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            String url = (String) request.get("url");
+            if (url == null || url.isEmpty()) {
+                result.put("code", 400);
+                result.put("message", "URL不能为空");
+                return ResponseEntity.badRequest().body(result);
+            }
+            
+            boolean success = ossUploadService.deleteFile(url);
+            
+            if (success) {
+                result.put("code", 200);
+                result.put("message", "文件删除成功");
+                return ResponseEntity.ok(result);
+            } else {
+                result.put("code", 500);
+                result.put("message", "文件删除失败");
+                return ResponseEntity.internalServerError().body(result);
+            }
+        } catch (Exception e) {
+            logger.error("删除文件失败: {}", e.getMessage());
+            result.put("code", 500);
+            result.put("message", "删除文件失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(result);
+        }
+    }
 }
