@@ -1,5 +1,6 @@
 <script setup>import { nextTick, onMounted, ref, reactive, watch } from 'vue';
 import { useRouter } from 'vue-router';
+import service from '../api/index.js';
 const router = useRouter();
 const currentUser = ref('');
 const messages = ref([
@@ -76,16 +77,9 @@ onMounted(async () => {
 const loadSessions = async () => {
  try {
  const token = localStorage.getItem('token');
- const response = await fetch('/api/sessions', {
+ const data = await service.get('/sessions', {
  headers: { 'Authorization': token || '' }
  });
- if (response.status === 401) {
- localStorage.removeItem('token');
- localStorage.removeItem('username');
- router.push('/');
- return;
- }
- const data = await response.json();
  if (data.code === 200) {
  sessions.value = data.data;
  }
@@ -96,14 +90,9 @@ const loadSessions = async () => {
 const createNewSession = async () => {
  try {
  const token = localStorage.getItem('token');
- const response = await fetch('/api/session/new', {
- method: 'POST',
- headers: {
- 'Content-Type': 'application/json',
- 'Authorization': token || ''
- }
+ const data = await service.post('/session/new', {}, {
+ headers: { 'Authorization': token || '' }
  });
- const data = await response.json();
  if (data.code === 200) {
  currentSessionId.value = data.data.sessionId;
  messages.value = [{ type: 'system', content: '欢迎使用小爱，发送消息开始聊天' }];
@@ -141,16 +130,9 @@ const loadMessages = async (page = 1) => {
  isLoadingMore.value = true;
  try {
  const token = localStorage.getItem('token');
- const response = await fetch(`/api/session/messages/page?sessionId=${currentSessionId.value}&pageNum=${page}&pageSize=${pageSize.value}`, {
+ const data = await service.get(`/session/messages/page?sessionId=${currentSessionId.value}&pageNum=${page}&pageSize=${pageSize.value}`, {
  headers: { 'Authorization': token || '' }
  });
- if (response.status === 401) {
- localStorage.removeItem('token');
- localStorage.removeItem('username');
- router.push('/');
- return;
- }
- const data = await response.json();
  if (data.code === 200 && data.data) {
  const newMessages = data.data.messages || [];
  const formattedMessages = newMessages.map(msg => ({
@@ -245,11 +227,9 @@ const deleteSession = async () => {
  const sessionId = sessionToDelete.value.id;
  try {
  const token = localStorage.getItem('token');
- const response = await fetch(`/api/session/delete/${sessionId}`, {
- method: 'DELETE',
+ const data = await service.delete(`/session/delete/${sessionId}`, {
  headers: { 'Authorization': token || '' }
  });
- const data = await response.json();
  if (data.code === 200) {
  showDeleteConfirm.value = false;
  sessionToDelete.value = null;
@@ -346,12 +326,16 @@ const sendMessage = async () => {
  }
  const reader = response.body.getReader();
  const decoder = new TextDecoder();
+ try {
  while (true) {
  const { done, value } = await reader.read();
  if (done)
  break;
  messages.value[botMessageIndex].content += decoder.decode(value, { stream: true });
  scrollToBottom();
+ }
+ } finally {
+ reader.releaseLock();
  }
  }
  catch (error) {
@@ -373,12 +357,9 @@ const uploadFile = async (type, file) => {
  const token = localStorage.getItem('token');
  const formData = new FormData();
  formData.append('file', file);
- const response = await fetch(`/api/upload/${type}`, {
- method: 'POST',
- headers: { 'Authorization': token || '' },
- body: formData
+ const data = await service.post(`/upload/${type}`, formData, {
+ headers: { 'Authorization': token || '' }
  });
- const data = await response.json();
  if (data.code === 200) {
  pendingMedia.value = {
  type: type === 'image' ? 'IMAGE' : 'FILE',
@@ -399,13 +380,9 @@ const removePendingMedia = async () => {
  if (pendingMedia.value && pendingMedia.value.url) {
  try {
  const token = localStorage.getItem('token');
- await fetch('/api/upload/delete', {
- method: 'DELETE',
- headers: {
- 'Content-Type': 'application/json',
- 'Authorization': token || ''
- },
- body: JSON.stringify({ url: pendingMedia.value.url })
+ await service.delete('/upload/delete', {
+ headers: { 'Authorization': token || '' },
+ data: { url: pendingMedia.value.url }
  });
  } catch (error) {
  console.error('删除待上传文件失败:', error);
@@ -551,12 +528,9 @@ const processAudio = async (audioBlob) => {
  const token = localStorage.getItem('token');
  const formData = new FormData();
  formData.append('audio', audioBlob, 'recording.wav');
- const response = await fetch('/api/speech-to-text', {
- method: 'POST',
- headers: { 'Authorization': token || '' },
- body: formData
+ const data = await service.post('/speech-to-text', formData, {
+ headers: { 'Authorization': token || '' }
  });
- const data = await response.json();
  if (data.code === 200 && data.data) {
  inputMessage.value += (inputMessage.value.trim() ? ' ' : '') + data.data;
  nextTick(() => {

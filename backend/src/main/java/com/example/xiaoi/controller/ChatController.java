@@ -337,7 +337,8 @@ public class ChatController {
                 return ResponseEntity.badRequest().body(result);
             }
             
-            boolean success = ossUploadService.deleteFile(url);
+            // 调用哈希去重删除（引用计数递减，为 0 时自动删除 OSS）
+            boolean success = ossUploadService.deleteWithDedup(url);
             
             if (success) {
                 result.put("code", 200);

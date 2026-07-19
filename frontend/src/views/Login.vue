@@ -1,6 +1,7 @@
 <script setup>
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
+import service from '../api/index.js'
 
 const router = useRouter()
 
@@ -19,18 +20,10 @@ const handleLogin = async () => {
   errorMessage.value = ''
 
   try {
-    const response = await fetch('/api/login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        username: username.value,
-        password: password.value
-      })
+    const data = await service.post('/login', {
+      username: username.value,
+      password: password.value
     })
-
-    const data = await response.json()
 
     if (data.code === 200) {
       localStorage.setItem('token', data.data.token)
