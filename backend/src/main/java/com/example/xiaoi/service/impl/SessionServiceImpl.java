@@ -50,10 +50,7 @@ public class SessionServiceImpl implements SessionService {
     private SessionAsyncService asyncService;
 
     @Autowired
-    private com.aliyun.oss.OSS ossClient;
-
-    @Autowired
-    private com.example.xiaoi.config.OSSConfig ossConfig;
+    private com.example.xiaoi.service.OSSUploadService ossUploadService;
 
     private static final String REDIS_KEY_PREFIX = "session:";
     private static final String REDIS_TURN_COUNT_PREFIX = "session:turn:";
@@ -377,14 +374,12 @@ public class SessionServiceImpl implements SessionService {
             for (SessionDetail detail : sessionDetails) {
                 String mediaUrl = detail.getMediaUrl();
                 if (mediaUrl != null && !mediaUrl.isEmpty()) {
-                    try {
-                        String objectName = extractObjectNameFromUrl(mediaUrl);
-                        if (objectName != null) {
-                            ossClient.deleteObject(ossConfig.getBucketName(), objectName);
-                            logger.info("删除OSS文件成功: {}", objectName);
-                        }
-                    } catch (Exception e) {
-                        logger.warn("删除OSS文件失败: {}, 错误={}", mediaUrl, e.getMessage());
+                    // 使用哈希去重删除（引用计数递减，为 0 时自动删除 OSS）
+                    boolean deleted = ossUploadService.deleteWithDedup(mediaUrl);
+                    if (deleted) {
+                        logger.info("OSS文件删除成功（哈希去重）: url={}", mediaUrl);
+                    } else {
+                        logger.warn("OSS文件删除失败: url={}", mediaUrl);
                     }
                 }
             }
@@ -417,15 +412,4 @@ public class SessionServiceImpl implements SessionService {
         }
     }
 
-    private String extractObjectNameFromUrl(String mediaUrl) {
-        try {
-            String prefix = "https://" + ossConfig.getBucketName() + "." + ossConfig.getEndpoint() + "/";
-            if (mediaUrl.startsWith(prefix)) {
-                return mediaUrl.substring(prefix.length());
-            }
-        } catch (Exception e) {
-            logger.debug("解析OSS URL失败: {}", mediaUrl);
-        }
-        return null;
-    }
 }

@@ -19,15 +19,11 @@ public class WebConfig implements WebMvcConfigurer {
     @Override
     public void addCorsMappings(CorsRegistry registry) {
         registry.addMapping("/api/**")
-                // 允许前端开发服务器域名访问
-                .allowedOrigins("http://localhost:5173")
-                // 允许的 HTTP 方法
+                .allowedOrigins("http://localhost:5173", "http://localhost:5174")
                 .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
-                // 允许所有请求头
                 .allowedHeaders("*")
-                // 暴露自定义响应头，供前端获取新会话 ID
                 .exposedHeaders("X-Session-Id")
-                // 允许携带凭证（Cookie、Authorization 等）
-                .allowCredentials(true);
+                .allowCredentials(true)
+                .maxAge(3600);
     }
 }
