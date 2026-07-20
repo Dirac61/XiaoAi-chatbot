@@ -77,7 +77,7 @@ class ChatRequest(BaseModel):
     message: str
     history: Optional[List[dict]] = None
     user_id: Optional[int] = None
-    session_id: Optional[int] = None
+    session_id: Optional[str] = None
     message_type: Optional[str] = "TEXT"
     media_url: Optional[str] = None
     media_urls: Optional[List[str]] = None

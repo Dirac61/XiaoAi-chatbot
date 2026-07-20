@@ -37,7 +37,7 @@ public class SessionController {
         
         result.put("code", 200);
         result.put("message", "创建成功");
-        result.put("data", Map.of("sessionId", sessionId));
+        result.put("data", Map.of("sessionId", String.valueOf(sessionId)));
         
         return result;
     }

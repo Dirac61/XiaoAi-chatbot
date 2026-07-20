@@ -121,7 +121,7 @@ public class ChatController {
         requestBody.put("message", request.getMessage());
         requestBody.put("history", history);
         requestBody.put("user_id", userId);
-        requestBody.put("session_id", sessionId);
+        requestBody.put("session_id", String.valueOf(sessionId));
         requestBody.put("message_type", messageType);
         requestBody.put("media_url", firstMediaUrl);
         if (request.getMediaUrls() != null && !request.getMediaUrls().isEmpty()) {
