@@ -34,6 +34,7 @@ let recordingInterval = null;
 const pendingMedia = ref(null);
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
+const pendingMedias = ref([]);
 const showDeleteConfirm = ref(false);
 const sessionToDelete = ref(null);
 const expandedExtracted = reactive({});
@@ -140,6 +141,8 @@ const loadMessages = async (page = 1) => {
  content: msg.content,
  messageType: msg.messageType || 'TEXT',
  mediaUrl: msg.mediaUrl,
+ mediaUrls: msg.mediaUrls,
+ fileNames: msg.fileNames,
  extractedText: msg.extractedText
  }));
  if (page === 1) {
@@ -269,48 +272,57 @@ const closeImagePreview = () => {
  previewImage.value = null;
 };
 const sendMessage = async () => {
- const hasPending = pendingMedia.value !== null;
- const textContent = inputMessage.value.trim();
- if (!textContent && !hasPending)
- return;
- if (isLoading.value)
- return;
- const finalMessageType = hasPending ? pendingMedia.value.type : 'TEXT';
- const finalMediaUrl = hasPending ? pendingMedia.value.url : null;
- const finalFileName = hasPending ? pendingMedia.value.name : null;
- const displayContent = finalFileName
- ? (textContent ? textContent : '')
- : textContent;
- const capturedType = finalMessageType;
- const capturedUrl = finalMediaUrl;
- const capturedText = textContent;
- inputMessage.value = '';
- pendingMedia.value = null;
- messages.value.push({
- type: 'user',
- content: displayContent,
- messageType: capturedType,
- mediaUrl: capturedUrl,
- fileName: finalFileName
- });
- const botMessageIndex = messages.value.push({ type: 'bot', content: '' }) - 1;
- isLoading.value = true;
- scrollToBottom();
- try {
- const token = localStorage.getItem('token');
- const response = await fetch('/api/chat', {
- method: 'POST',
- headers: {
- 'Content-Type': 'application/json',
- 'Authorization': token || ''
- },
- body: JSON.stringify({
- message: finalFileName ? (capturedText || finalFileName) : capturedText,
- messageType: capturedType,
- mediaUrl: capturedUrl,
- sessionId: currentSessionId.value
- })
- });
+  const hasPending = pendingMedias.value.length > 0;
+  const textContent = inputMessage.value.trim();
+  if (!textContent && !hasPending)
+    return;
+  if (isLoading.value)
+    return;
+  const finalMessageType = hasPending ? pendingMedias.value[0].type : 'TEXT';
+  const finalMediaUrls = hasPending ? pendingMedias.value.map(m => m.url) : null;
+  const finalFileNames = hasPending ? pendingMedias.value.map(m => m.name) : null;
+  const displayContent = hasPending
+    ? (textContent ? textContent : '')
+    : textContent;
+  const capturedType = finalMessageType;
+  const capturedUrls = finalMediaUrls;
+  const capturedText = textContent;
+  inputMessage.value = '';
+  const mediasToSend = [...pendingMedias.value];
+  pendingMedias.value = [];
+  messages.value.push({
+    type: 'user',
+    content: displayContent,
+    messageType: capturedType,
+    mediaUrls: capturedUrls,
+    mediaUrl: capturedUrls ? capturedUrls[0] : null,
+    fileNames: finalFileNames
+  });
+  const botMessageIndex = messages.value.push({ type: 'bot', content: '' }) - 1;
+  isLoading.value = true;
+  scrollToBottom();
+  try {
+    const token = localStorage.getItem('token');
+    const requestBody = {
+      message: hasPending ? (capturedText || finalFileNames.join(', ')) : capturedText,
+      messageType: capturedType,
+      sessionId: currentSessionId.value
+    };
+    if (capturedUrls && capturedUrls.length > 0) {
+      if (capturedUrls.length === 1) {
+        requestBody.mediaUrl = capturedUrls[0];
+      } else {
+        requestBody.mediaUrls = capturedUrls;
+      }
+    }
+    const response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': token || ''
+      },
+      body: JSON.stringify(requestBody)
+    });
  if (response.status === 401) {
  localStorage.removeItem('token');
  localStorage.removeItem('username');
@@ -345,61 +357,89 @@ const sendMessage = async () => {
  isLoading.value = false;
  }
 };
-const uploadFile = async (type, file) => {
- if (isLoading.value)
- return;
- const maxSize = type === 'image' ? MAX_IMAGE_SIZE : MAX_FILE_SIZE;
- if (file.size > maxSize) {
- alert(`${type === 'image' ? '图片' : '文件'}大小超过限制（最大${type === 'image' ? '10MB' : '50MB'}）`);
- return;
- }
- try {
- const token = localStorage.getItem('token');
- const formData = new FormData();
- formData.append('file', file);
- const data = await service.post(`/upload/${type}`, formData, {
- headers: { 'Authorization': token || '' }
- });
- if (data.code === 200) {
- pendingMedia.value = {
- type: type === 'image' ? 'IMAGE' : 'FILE',
- url: data.data,
- name: file.name
- };
- }
- else {
- alert(data.message || '上传失败');
- }
- }
- catch (error) {
- console.error('上传失败:', error);
- alert('上传失败');
- }
+const uploadFiles = async (type, files) => {
+  if (isLoading.value)
+    return;
+  const maxSize = type === 'image' ? MAX_IMAGE_SIZE : MAX_FILE_SIZE;
+  const validFiles = [];
+  for (const file of files) {
+    if (file.size > maxSize) {
+      alert(`${type === 'image' ? '图片' : '文件'}大小超过限制（最大${type === 'image' ? '10MB' : '50MB'}）`);
+      return;
+    }
+    validFiles.push(file);
+  }
+  if (validFiles.length === 0)
+    return;
+  try {
+    const token = localStorage.getItem('token');
+    const formData = new FormData();
+    for (const file of validFiles) {
+      formData.append('files', file);
+    }
+    const data = await service.post(`/upload/${type}s`, formData, {
+      headers: { 'Authorization': token || '' }
+    });
+    if (data.code === 200) {
+      const urls = data.data;
+      for (let i = 0; i < urls.length && i < validFiles.length; i++) {
+        pendingMedias.value.push({
+          type: type === 'image' ? 'IMAGE' : 'FILE',
+          url: urls[i],
+          name: validFiles[i].name
+        });
+      }
+    }
+    else {
+      alert(data.message || '上传失败');
+    }
+  }
+  catch (error) {
+    console.error('上传失败:', error);
+    alert('上传失败');
+  }
 };
-const removePendingMedia = async () => {
- if (pendingMedia.value && pendingMedia.value.url) {
+const removePendingMedia = async (index) => {
+ const media = pendingMedias.value[index];
+ if (media && media.url) {
  try {
  const token = localStorage.getItem('token');
  await service.delete('/upload/delete', {
  headers: { 'Authorization': token || '' },
- data: { url: pendingMedia.value.url }
+ data: { url: media.url }
  });
  } catch (error) {
  console.error('删除待上传文件失败:', error);
  }
  }
- pendingMedia.value = null;
+ pendingMedias.value.splice(index, 1);
+};
+const clearAllPendingMedias = async () => {
+ for (const media of pendingMedias.value) {
+ if (media && media.url) {
+ try {
+ const token = localStorage.getItem('token');
+ await service.delete('/upload/delete', {
+ headers: { 'Authorization': token || '' },
+ data: { url: media.url }
+ });
+ } catch (error) {
+ console.error('删除待上传文件失败:', error);
+ }
+ }
+ }
+ pendingMedias.value = [];
 };
 const handleImageUpload = (event) => {
- const file = event.target.files[0];
- if (file)
- uploadFile('image', file);
+ const files = Array.from(event.target.files);
+ if (files.length > 0)
+ uploadFiles('image', files);
  event.target.value = '';
 };
 const handleFileUpload = (event) => {
- const file = event.target.files[0];
- if (file)
- uploadFile('file', file);
+ const files = Array.from(event.target.files);
+ if (files.length > 0)
+ uploadFiles('file', files);
  event.target.value = '';
 };
 const startRecording = async () => {
@@ -599,25 +639,29 @@ const processAudio = async (audioBlob) => {
               </div>
               
               <template v-else-if="msg.type === 'user'">
-                <div v-if="msg.messageType === 'IMAGE' && msg.mediaUrl" class="media-section">
-                  <div class="image-wrapper" @click="openImagePreview(msg.mediaUrl)">
-                    <img :src="msg.mediaUrl" alt="图片" class="message-image" @load="imageLoaded" />
-                    <div class="image-overlay">
-                      <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="white" stroke-width="2">
-                        <circle cx="12" cy="12" r="3"/>
-                        <path d="M15 12l3.09-3.09a1.5 1.5 0 0 1 2.12 2.12L12 15"/>
-                        <path d="M9 12l-3.09 3.09a1.5 1.5 0 0 1-2.12-2.12L12 9"/>
-                      </svg>
+                <div v-if="msg.messageType === 'IMAGE' && (msg.mediaUrls || msg.mediaUrl)" class="media-section">
+                  <div class="media-grid">
+                    <div v-for="(url, idx) in (msg.mediaUrls || [msg.mediaUrl])" :key="idx" class="image-wrapper" @click="openImagePreview(url)">
+                      <img :src="url" alt="图片" class="message-image" @load="imageLoaded" />
+                      <div class="image-overlay">
+                        <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="white" stroke-width="2">
+                          <circle cx="12" cy="12" r="3"/>
+                          <path d="M15 12l3.09-3.09a1.5 1.5 0 0 1 2.12 2.12L12 15"/>
+                          <path d="M9 12l-3.09 3.09a1.5 1.5 0 0 1-2.12-2.12L12 9"/>
+                        </svg>
+                      </div>
                     </div>
                   </div>
                 </div>
-                <div v-if="msg.messageType === 'FILE' && msg.mediaUrl" class="media-section">
-                  <a :href="msg.mediaUrl" target="_blank" class="file-card">
-                    <div class="file-icon">📄</div>
-                    <div class="file-info">
-                      <span class="file-name">{{ msg.fileName || msg.content }}</span>
-                    </div>
-                  </a>
+                <div v-if="msg.messageType === 'FILE' && (msg.mediaUrls || msg.mediaUrl)" class="media-section">
+                  <div class="media-list">
+                    <a v-for="(url, idx) in (msg.mediaUrls || [msg.mediaUrl])" :key="idx" :href="url" target="_blank" class="file-card">
+                      <div class="file-icon">📄</div>
+                      <div class="file-info">
+                        <span class="file-name">{{ (msg.fileNames && msg.fileNames[idx]) || msg.fileName || msg.content }}</span>
+                      </div>
+                    </a>
+                  </div>
                 </div>
                 <span v-if="msg.content" class="message-text">{{ msg.content }}</span>
                 <div v-if="msg.extractedText" class="extracted-container">
@@ -646,19 +690,24 @@ const processAudio = async (audioBlob) => {
         </div>
 
         <div class="chat-input-area">
-          <div v-if="pendingMedia" class="pending-preview">
-            <span class="pending-label">
-              <template v-if="pendingMedia.type === 'IMAGE'">🖼️</template>
-              <template v-else>📎</template>
-              {{ pendingMedia.name }}
-            </span>
-            <button class="pending-remove" @click="removePendingMedia">✕</button>
+          <div v-if="pendingMedias.length > 0" class="pending-preview">
+            <div class="pending-medias">
+              <div v-for="(media, idx) in pendingMedias" :key="idx" class="pending-item">
+                <span class="pending-label">
+                  <template v-if="media.type === 'IMAGE'">🖼️</template>
+                  <template v-else>📎</template>
+                  {{ media.name }}
+                </span>
+                <button class="pending-remove" @click="removePendingMedia(idx)">✕</button>
+              </div>
+            </div>
+            <button class="pending-clear-all" @click="clearAllPendingMedias">清除全部</button>
           </div>
 
           <div class="chat-input">
             <div class="input-tools">
               <div class="tool-btn-wrapper">
-                <input type="file" accept="image/*" class="tool-input" id="image-input" @change="handleImageUpload" />
+                <input type="file" accept="image/*" class="tool-input" id="image-input" @change="handleImageUpload" multiple />
                 <label for="image-input" class="tool-btn" :class="{ disabled: isLoading }">
                   <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
                     <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
@@ -669,7 +718,7 @@ const processAudio = async (audioBlob) => {
               </div>
 
               <div class="tool-btn-wrapper">
-                <input type="file" class="tool-input" id="file-input" @change="handleFileUpload" />
+                <input type="file" class="tool-input" id="file-input" @change="handleFileUpload" multiple />
                 <label for="file-input" class="tool-btn" :class="{ disabled: isLoading }">
                   <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -1093,6 +1142,43 @@ const processAudio = async (audioBlob) => {
 .pending-remove:hover { 
   color: #ef4444; 
   background-color: #fef2f2;
+}
+.pending-medias {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.pending-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pending-clear-all {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+  padding: 8px 14px;
+  border-radius: 16px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-weight: 500;
+}
+.pending-clear-all:hover {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 10px;
+  max-width: 360px;
+}
+.media-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .chat-input {
