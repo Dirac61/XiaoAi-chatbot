@@ -305,11 +305,19 @@ Assistant: 你好
 - 确保JSON格式正确，逗号、引号、括号配对完整
 - 如果没有可提取的记忆，输出空数组：[]"""
 
+        media_count = messages_text.count("[图片内容]") + messages_text.count("[文件内容]")
+        max_memory_count = max(5, 3 + media_count)
+        max_content_length = 80
+
         user_prompt = f"""对话内容：
 {messages_text}
 
 已有记忆：
 {existing_memories if existing_memories else "无"}
+
+约束条件：
+- 每条记忆内容长度不超过{max_content_length}字
+- 提取的记忆数量不超过{max_memory_count}条
 
 请提取本轮对话的关键记忆。"""
 
@@ -321,6 +329,18 @@ Assistant: 你好
                 client = AsyncOpenAI(api_key=API_KEY, base_url=API_BASE)
                 model = "qwen3.7-plus"
 
+            memory_units = await self._extract_with_retry(client, model, system_prompt, user_prompt, messages_text, user_id, session_id, max_memory_count, max_content_length)
+            return memory_units
+        except Exception as e:
+            logger.error(f"记忆提取失败: {e}")
+            return []
+
+    async def _extract_with_retry(self, client, model, system_prompt, user_prompt, messages_text, user_id, session_id, max_memory_count, max_content_length):
+        """
+        带重试的记忆提取，格式校验失败时重试一次
+        """
+        max_retries = 2
+        for attempt in range(1, max_retries + 1):
             response = await client.chat.completions.create(
                 model=model,
                 messages=[
@@ -328,32 +348,62 @@ Assistant: 你好
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=500
+                max_tokens=2000
             )
 
             if response.choices and response.choices[0].message and response.choices[0].message.content:
                 content = response.choices[0].message.content.strip()
-                logger.debug(f"记忆提取模型原始响应: {content}")
+                logger.debug(f"记忆提取模型原始响应(第{attempt}次): {content}")
+                
+                content = content.strip()
+                if content.startswith("```"):
+                    content = content.split("```")[1]
+                    if content.startswith("json"):
+                        content = content[4:].strip()
+                
                 import json
                 try:
                     memory_units = json.loads(content)
                     if isinstance(memory_units, list):
-                        if len(memory_units) == 0:
+                        valid_units = []
+                        for unit in memory_units[:max_memory_count]:
+                            if isinstance(unit, dict) and unit.get("content") and unit.get("type"):
+                                content_str = str(unit["content"])
+                                if len(content_str) <= max_content_length:
+                                    valid_units.append(unit)
+                                else:
+                                    logger.debug(f"记忆内容过长({len(content_str)}>={max_content_length}), 跳过")
+                        
+                        for unit in valid_units:
+                            unit["userId"] = user_id
+                            unit["sessionId"] = session_id
+                            unit["timestamp"] = int(asyncio.get_event_loop().time())
+                        
+                        if len(valid_units) == 0:
                             logger.info(f"提取结果: 空数组(纯问候语或无新信息), user_id={user_id}, session_id={session_id}")
                         else:
-                            for unit in memory_units:
-                                unit["userId"] = user_id
-                                unit["sessionId"] = session_id
-                                unit["timestamp"] = int(asyncio.get_event_loop().time())
-                            logger.info(f"提取结果: {len(memory_units)} 个记忆单元, user_id={user_id}, session_id={session_id}")
-                        return memory_units
+                            logger.info(f"提取结果: {len(valid_units)} 个记忆单元, user_id={user_id}, session_id={session_id}")
+                        return valid_units
                 except json.JSONDecodeError:
-                    logger.warning(f"解析记忆提取响应失败: {content[:200]}")
-            logger.info(f"提取结果: 无响应或解析失败, user_id={user_id}, session_id={session_id}")
-            return []
-        except Exception as e:
-            logger.error(f"记忆提取失败: {e}")
-            return []
+                    logger.warning(f"第{attempt}次提取格式校验失败: {content[:300]}")
+            
+            if attempt < max_retries:
+                logger.info(f"第{attempt}次提取失败，准备重试...")
+                user_prompt = f"""对话内容：
+{messages_text}
+
+已有记忆：
+无
+
+约束条件：
+- 每条记忆内容长度不超过{max_content_length}字
+- 提取的记忆数量不超过{max_memory_count}条
+- 必须输出严格的JSON数组格式，不要包含任何其他文字
+
+请重新提取本轮对话的关键记忆。"""
+        
+        logger.info(f"提取结果: 重试{max_retries}次仍失败, user_id={user_id}, session_id={session_id}")
+        return []
 
     def _generate_stable_point_id(self, content: str, user_id: int) -> str:
         """

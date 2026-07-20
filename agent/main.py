@@ -80,6 +80,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[int] = None
     message_type: Optional[str] = "TEXT"
     media_url: Optional[str] = None
+    media_urls: Optional[List[str]] = None
     message_uuid: Optional[str] = None
 
 
@@ -217,7 +218,7 @@ async def download_and_read_text(media_url: str) -> str:
 
 async def extract_media_text(media_url: str, media_type: str) -> str:
     """
-    异步提取图片/文件的文本信息
+    异步提取单张图片/单个文件的文本信息
     - 图片：使用多模态模型进行图像描述
     - DOCX文件：本地提取文本和表格（不提取图像）
     - 其他文件：使用文本模型分析文件URL
@@ -311,9 +312,31 @@ async def extract_media_text(media_url: str, media_type: str) -> str:
             return ""
 
 
+async def extract_media_text_batch(media_urls: List[str], media_type: str) -> str:
+    """
+    异步提取多张图片/多个文件的文本信息
+    :param media_urls: 媒体文件URL列表
+    :param media_type: 媒体类型 IMAGE/FILE
+    :return: 提取的文本内容（合并后的）
+    """
+    logger.info(f"开始批量提取{media_type}文本: 数量={len(media_urls)}")
+    
+    all_extracted = []
+    for i, url in enumerate(media_urls):
+        logger.info(f"提取第{i+1}/{len(media_urls)}个{media_type}: {url[:50]}...")
+        text = await extract_media_text(url, media_type)
+        if text:
+            all_extracted.append(f"【文件{i+1}】\n{text}")
+        else:
+            all_extracted.append(f"【文件{i+1}】\n[提取失败]")
+    
+    return "\n\n".join(all_extracted)
+
+
 async def stream_model_response(message: str, history: Optional[List[dict]] = None,
                                 user_id: Optional[int] = None, session_id: Optional[int] = None,
                                 message_type: str = "TEXT", media_url: Optional[str] = None,
+                                media_urls: Optional[List[str]] = None,
                                 message_uuid: Optional[str] = None):
     """
     流式生成模型响应（支持多模态）
@@ -335,20 +358,30 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
     logger.info(f"message_type: '{message_type}'")
     logger.info(f"is_multimodal: {is_multimodal}")
     logger.info(f"media_url: '{media_url[:50]}...'" if media_url else "media_url: None")
-    logger.info(f"media_url is None: {media_url is None}")
-    logger.info(f"提取条件: is_multimodal={is_multimodal}, media_url存在={media_url is not None}")
+    logger.info(f"media_urls数量: {len(media_urls) if media_urls else 0}")
+    logger.info(f"提取条件: is_multimodal={is_multimodal}, media_url存在={media_url is not None}, media_urls存在={media_urls is not None and len(media_urls) > 0}")
     
-    if is_multimodal and media_url:
-        logger.info(f"开始同步提取{message_type}文本: {media_url[:50]}...")
-        extracted_text = await extract_media_text(media_url, message_type)
-        logger.info(f"=== 提取结果确认 ===")
-        logger.info(f"extract_media_text返回值类型: {type(extracted_text)}")
-        logger.info(f"extract_media_text返回值: '{extracted_text[:100]}...'" if extracted_text else "extract_media_text返回值: None")
-        logger.info(f"extract_media_text返回值长度: {len(extracted_text) if extracted_text else 0}")
-        if extracted_text:
-            logger.info(f"{message_type}文本提取成功，长度: {len(extracted_text)}字符")
+    if is_multimodal and (media_url or (media_urls and len(media_urls) > 0)):
+        if media_urls and len(media_urls) > 0:
+            logger.info(f"开始批量提取{message_type}文本: 数量={len(media_urls)}")
+            extracted_text = await extract_media_text_batch(media_urls, message_type)
+            logger.info(f"=== 批量提取结果确认 ===")
+            logger.info(f"extract_media_text_batch返回值长度: {len(extracted_text) if extracted_text else 0}")
+            if extracted_text:
+                logger.info(f"{message_type}批量文本提取成功，长度: {len(extracted_text)}字符")
+            else:
+                logger.warning(f"{message_type}批量文本提取失败，将使用原始消息进行记忆检索")
         else:
-            logger.warning(f"{message_type}文本提取失败，将使用原始消息进行记忆检索")
+            logger.info(f"开始同步提取{message_type}文本: {media_url[:50]}...")
+            extracted_text = await extract_media_text(media_url, message_type)
+            logger.info(f"=== 提取结果确认 ===")
+            logger.info(f"extract_media_text返回值类型: {type(extracted_text)}")
+            logger.info(f"extract_media_text返回值: '{extracted_text[:100]}...'" if extracted_text else "extract_media_text返回值: None")
+            logger.info(f"extract_media_text返回值长度: {len(extracted_text) if extracted_text else 0}")
+            if extracted_text:
+                logger.info(f"{message_type}文本提取成功，长度: {len(extracted_text)}字符")
+            else:
+                logger.warning(f"{message_type}文本提取失败，将使用原始消息进行记忆检索")
 
     memories = []
     if session_id:
@@ -405,14 +438,22 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
 
     is_multimodal = message_type == "IMAGE"
     
-    if is_multimodal and media_url:
+    if is_multimodal and (media_urls and len(media_urls) > 0):
+        user_content = [{"type": "text", "text": message}]
+        for url in media_urls:
+            user_content.append({"type": "image_url", "image_url": {"url": url}})
+        logger.info(f"多图片消息内容构建完成，图片数量: {len(media_urls)}")
+    elif is_multimodal and media_url:
         user_content = [
             {"type": "text", "text": message},
             {"type": "image_url", "image_url": {"url": media_url}}
         ]
-    elif message_type == "FILE" and media_url:
+    elif message_type == "FILE" and (media_url or (media_urls and len(media_urls) > 0)):
         file_text = f"\n文件内容:\n{extracted_text}" if extracted_text else ""
-        user_content = f"[用户上传了文件]\n文件地址: {media_url}\n用户提问: {message}{file_text}"
+        if media_urls and len(media_urls) > 0:
+            user_content = f"[用户上传了{len(media_urls)}个文件]\n用户提问: {message}{file_text}"
+        else:
+            user_content = f"[用户上传了文件]\n文件地址: {media_url}\n用户提问: {message}{file_text}"
         logger.info(f"文件消息内容构建完成，提取文本长度: {len(extracted_text) if extracted_text else 0}, 总内容长度: {len(user_content)}")
         logger.debug(f"文件消息内容:\n{user_content[:500]}...")
     else:
@@ -561,7 +602,8 @@ async def chat(request: ChatRequest):
     logger.info(f"收到聊天请求: type={request.message_type}, message='{request.message[:100]}...', "
                 f"history={len(request.history) if request.history else 0}条, "
                 f"user_id={request.user_id}, session_id={request.session_id}, "
-                f"media_url={request.media_url[:30]}..." if request.media_url else "media_url=None")
+                f"media_url={request.media_url[:30]}..." if request.media_url else "media_url=None"
+                f", media_urls数量={len(request.media_urls) if request.media_urls else 0}")
     return StreamingResponse(
         stream_model_response(
             request.message, 
@@ -570,6 +612,7 @@ async def chat(request: ChatRequest):
             request.session_id,
             request.message_type or "TEXT",
             request.media_url,
+            request.media_urls,
             request.message_uuid
         ),
         media_type="text/event-stream"

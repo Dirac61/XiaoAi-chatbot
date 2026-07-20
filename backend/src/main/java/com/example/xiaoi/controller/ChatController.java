@@ -105,9 +105,17 @@ public class ChatController {
         userMessage.put("content", request.getMessage());
         userMessage.put("messageType", messageType);
         userMessage.put("mediaUrl", request.getMediaUrl());
+        if (request.getMediaUrls() != null && !request.getMediaUrls().isEmpty()) {
+            userMessage.put("mediaUrls", request.getMediaUrls());
+        }
         userMessage.put("timestamp", System.currentTimeMillis());
         userMessage.put("messageUuid", messageUuid);
-        sessionService.saveMessage(sessionId, userMessage, messageType, request.getMediaUrl());
+        
+        String firstMediaUrl = request.getMediaUrl();
+        if (firstMediaUrl == null && request.getMediaUrls() != null && !request.getMediaUrls().isEmpty()) {
+            firstMediaUrl = request.getMediaUrls().get(0);
+        }
+        sessionService.saveMessage(sessionId, userMessage, messageType, firstMediaUrl);
 
         Map<String, Object> requestBody = new HashMap<>();
         requestBody.put("message", request.getMessage());
@@ -115,7 +123,10 @@ public class ChatController {
         requestBody.put("user_id", userId);
         requestBody.put("session_id", sessionId);
         requestBody.put("message_type", messageType);
-        requestBody.put("media_url", request.getMediaUrl());
+        requestBody.put("media_url", firstMediaUrl);
+        if (request.getMediaUrls() != null && !request.getMediaUrls().isEmpty()) {
+            requestBody.put("media_urls", request.getMediaUrls());
+        }
         requestBody.put("message_uuid", messageUuid);
 
         return outputStream -> {
@@ -251,6 +262,86 @@ public class ChatController {
             return ResponseEntity.ok(result);
         } catch (IOException e) {
             logger.error("文件上传失败: {}", e.getMessage());
+            result.put("code", 500);
+            result.put("message", "文件上传失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(result);
+        }
+    }
+
+    @PostMapping("/upload/images")
+    public ResponseEntity<Map<String, Object>> uploadImages(@RequestParam("files") MultipartFile[] files) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            if (files == null || files.length == 0) {
+                result.put("code", 400);
+                result.put("message", "请选择要上传的图片");
+                return ResponseEntity.badRequest().body(result);
+            }
+            
+            List<String> urls = new java.util.ArrayList<>();
+            for (MultipartFile file : files) {
+                if (!isValidImageType(file.getContentType())) {
+                    result.put("code", 400);
+                    result.put("message", "不支持的图片格式，仅支持JPG、PNG、GIF、WebP");
+                    return ResponseEntity.badRequest().body(result);
+                }
+                
+                if (file.getSize() > MAX_IMAGE_SIZE) {
+                    result.put("code", 400);
+                    result.put("message", "图片大小超过限制（最大10MB）");
+                    return ResponseEntity.badRequest().body(result);
+                }
+                
+                String url = ossUploadService.uploadImage(file);
+                urls.add(url);
+            }
+            
+            result.put("code", 200);
+            result.put("data", urls);
+            return ResponseEntity.ok(result);
+        } catch (IOException e) {
+            logger.error("批量图片上传失败: {}", e.getMessage());
+            result.put("code", 500);
+            result.put("message", "图片上传失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(result);
+        }
+    }
+
+    @PostMapping("/upload/files")
+    public ResponseEntity<Map<String, Object>> uploadFiles(@RequestParam("files") MultipartFile[] files) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            if (files == null || files.length == 0) {
+                result.put("code", 400);
+                result.put("message", "请选择要上传的文件");
+                return ResponseEntity.badRequest().body(result);
+            }
+            
+            List<String> urls = new java.util.ArrayList<>();
+            for (MultipartFile file : files) {
+                if (!isValidFileType(file.getContentType())) {
+                    result.put("code", 400);
+                    result.put("message", "不支持的文件格式，仅支持PDF、DOC、DOCX、TXT、XLS、XLSX");
+                    return ResponseEntity.badRequest().body(result);
+                }
+                
+                if (file.getSize() > MAX_FILE_SIZE) {
+                    result.put("code", 400);
+                    result.put("message", "文件大小超过限制（最大50MB）");
+                    return ResponseEntity.badRequest().body(result);
+                }
+                
+                String url = ossUploadService.uploadFile(file);
+                urls.add(url);
+            }
+            
+            result.put("code", 200);
+            result.put("data", urls);
+            return ResponseEntity.ok(result);
+        } catch (IOException e) {
+            logger.error("批量文件上传失败: {}", e.getMessage());
             result.put("code", 500);
             result.put("message", "文件上传失败: " + e.getMessage());
             return ResponseEntity.internalServerError().body(result);

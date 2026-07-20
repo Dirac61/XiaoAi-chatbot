@@ -70,6 +70,20 @@ public class OSSUploadService {
     }
 
     /**
+     * 批量上传图片（带哈希去重）
+     */
+    public java.util.List<String> uploadImages(MultipartFile[] files) throws IOException {
+        return uploadWithDedupBatch(files, "IMAGE");
+    }
+
+    /**
+     * 批量上传文件（带哈希去重）
+     */
+    public java.util.List<String> uploadFiles(MultipartFile[] files) throws IOException {
+        return uploadWithDedupBatch(files, "FILE");
+    }
+
+    /**
      * 哈希去重上传入口
      * <p>
      * 流程：
@@ -94,6 +108,17 @@ public class OSSUploadService {
         logger.info("上传总耗时: original={}, md5={}ms, 事务={}ms, total={}ms",
                 file.getOriginalFilename(), (t1 - t0), (t3 - t2), (t3 - t0));
         return url;
+    }
+
+    /**
+     * 批量哈希去重上传入口
+     */
+    public java.util.List<String> uploadWithDedupBatch(MultipartFile[] files, String fileType) throws IOException {
+        java.util.List<String> urls = new java.util.ArrayList<>(files.length);
+        for (MultipartFile file : files) {
+            urls.add(uploadWithDedup(file, fileType));
+        }
+        return urls;
     }
 
     /**
@@ -358,6 +383,6 @@ public class OSSUploadService {
 
         public boolean isDeleteOss() {
             return deleteOss;
-        }
+         }
     }
 }
