@@ -73,6 +73,15 @@ public interface SessionService {
     void updateMessageContent(Long sessionId, String messageUuid, String message, String extractedText);
 
     /**
+     * 更新消息的搜索结果（用于快速模式联网搜索后保存结果）
+     * 通过消息UUID查找并更新消息的searchResults字段
+     * @param sessionId 会话 ID
+     * @param messageUuid 消息唯一标识（UUID格式）
+     * @param searchResults 搜索结果JSON字符串（包含文章标题和URL）
+     */
+    void updateMessageSearchResults(Long sessionId, String messageUuid, String searchResults);
+
+    /**
      * 删除会话及所有相关数据
      * 删除内容包括：MySQL中的session和session_detail记录、Redis中的会话缓存、OSS中的媒体文件、Qdrant中的记忆数据
      * @param sessionId 会话 ID
