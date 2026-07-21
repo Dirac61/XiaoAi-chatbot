@@ -363,6 +363,40 @@ public class SessionServiceImpl implements SessionService {
     }
 
     @Override
+    public void updateMessageSearchResults(Long sessionId, String messageUuid, String searchResults) {
+        logger.info("开始更新消息搜索结果: sessionId={}, messageUuid={}, searchResultsLength={}", 
+            sessionId, messageUuid, searchResults != null ? searchResults.length() : 0);
+        
+        try {
+            String redisKey = REDIS_KEY_PREFIX + sessionId;
+            List<String> redisMessages = redisTemplate.opsForList().range(redisKey, 0, -1);
+            
+            if (redisMessages != null) {
+                for (int i = 0; i < redisMessages.size(); i++) {
+                    try {
+                        Map<String, Object> msg = objectMapper.readValue(redisMessages.get(i), 
+                            new TypeReference<Map<String, Object>>() {});
+                        String uuid = (String) msg.get("messageUuid");
+                        if (messageUuid.equals(uuid)) {
+                            msg.put("searchResults", searchResults);
+                            String updatedJson = objectMapper.writeValueAsString(msg);
+                            redisTemplate.opsForList().set(redisKey, i, updatedJson);
+                            logger.info("Redis消息搜索结果更新成功: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                            break;
+                        }
+                    } catch (JsonProcessingException e) {
+                        logger.error("解析Redis消息失败: {}", e.getMessage());
+                    }
+                }
+            } else {
+                logger.warn("Redis中未找到消息: sessionId={}", sessionId);
+            }
+        } catch (Exception e) {
+            logger.error("更新消息搜索结果失败: sessionId={}, messageUuid={}, 错误={}", sessionId, messageUuid, e.getMessage(), e);
+        }
+    }
+
+    @Override
     public boolean deleteSession(Long sessionId) {
         logger.info("开始删除会话: sessionId={}", sessionId);
         

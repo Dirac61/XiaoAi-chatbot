@@ -199,7 +199,7 @@ class MemoryService:
             return None
 
     async def extract_memory_units(self, user_message: str, assistant_message: str,
-                                   user_id: int, session_id: int = None, existing_memories: List[str] = None) -> List[Dict[str, Any]]:
+                                   user_id: int, session_id: str = None, existing_memories: List[str] = None) -> List[Dict[str, Any]]:
         """
         从对话中提取记忆单元，调用记忆提取模型进行语义分析
         :param user_message: 用户消息
@@ -335,7 +335,7 @@ Assistant: 你好
             logger.error(f"记忆提取失败: {e}")
             return []
 
-    async def _extract_with_retry(self, client, model, system_prompt, user_prompt, messages_text, user_id, session_id, max_memory_count, max_content_length):
+    async def _extract_with_retry(self, client, model, system_prompt, user_prompt, messages_text, user_id, session_id: str, max_memory_count, max_content_length):
         """
         带重试的记忆提取，格式校验失败时重试一次
         """
@@ -419,7 +419,7 @@ Assistant: 你好
         logger.debug(f"生成稳定point_id: content='{content[:30]}...', user_id={user_id}, point_id={point_id}")
         return point_id
 
-    def _is_duplicate_literal(self, point_id: str, session_id: int) -> bool:
+    def _is_duplicate_literal(self, point_id: str, session_id: str) -> bool:
         """
         第一层去重：检查Redis中是否已存在相同的point_id（字面去重）
         :param point_id: 记忆点ID
@@ -438,7 +438,7 @@ Assistant: 你好
         logger.debug(f"字面去重未命中: point_id={point_id[:20]}..., session_id={session_id}")
         return False
 
-    def _mark_as_stored(self, point_id: str, session_id: int):
+    def _mark_as_stored(self, point_id: str, session_id: str):
         """
         将已存储的记忆点ID标记到Redis，用于后续字面去重
         :param point_id: 记忆点ID
@@ -453,7 +453,7 @@ Assistant: 你好
         self.redis_client.expire(redis_key, 30 * 24 * 3600)
         logger.debug(f"📝 标记已存储: point_id={point_id[:20]}..., session_id={session_id}, result={result}")
 
-    async def _is_duplicate_vector(self, content: str, dense_vector: List[float], session_id: int, threshold: float = 0.85) -> bool:
+    async def _is_duplicate_vector(self, content: str, dense_vector: List[float], session_id: str, threshold: float = 0.85) -> bool:
         """
         第二层去重：检查向量库中是否存在相似记忆（向量相似度去重）
         :param content: 记忆内容
@@ -576,7 +576,7 @@ Assistant: 你好
         else:
             logger.warning(f"📥 处理后没有有效的记忆点需要存储(字面去重={skipped_literal}, 向量去重={skipped_vector}, 嵌入失败={failed_embedding})")
 
-    async def search_memories(self, query: str, session_id: int, top_k: int = 10) -> List[Dict[str, Any]]:
+    async def search_memories(self, query: str, session_id: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
         混合搜索记忆：稠密向量搜索 + BM25关键词搜索 + 重要性分数融合 + Rerank重排序
         :param query: 查询文本
@@ -732,7 +732,7 @@ Assistant: 你好
             return results
 
     async def async_extract_and_store(self, user_message: str, assistant_message: str,
-                                      user_id: int, session_id: int = None, existing_memories: List[str] = None):
+                                      user_id: int, session_id: str = None, existing_memories: List[str] = None):
         """
         异步提取记忆并存储（线程池执行）
         :param user_message: 用户消息

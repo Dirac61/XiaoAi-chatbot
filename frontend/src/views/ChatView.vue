@@ -38,6 +38,7 @@ const pendingMedias = ref([]);
 const showDeleteConfirm = ref(false);
 const sessionToDelete = ref(null);
 const expandedExtracted = reactive({});
+const expandedSearch = reactive({});
 const previewImage = ref(null);
 const imageLoaded = () => {
  setTimeout(() => {
@@ -143,7 +144,8 @@ const loadMessages = async (page = 1) => {
  mediaUrl: msg.mediaUrl,
  mediaUrls: msg.mediaUrls,
  fileNames: msg.fileNames,
- extractedText: msg.extractedText
+ extractedText: msg.extractedText,
+ searchResults: msg.searchResults
  }));
  if (page === 1) {
  messages.value = [...formattedMessages.reverse()];
@@ -258,12 +260,34 @@ const deleteSession = async () => {
  }
 };
 const toggleExtracted = (index) => {
- if (expandedExtracted[index]) {
- delete expandedExtracted[index];
- }
- else {
- expandedExtracted[index] = true;
- }
+  if (expandedExtracted[index]) {
+    delete expandedExtracted[index];
+  }
+  else {
+    expandedExtracted[index] = true;
+  }
+};
+const toggleSearch = (index) => {
+  if (expandedSearch[index]) {
+    delete expandedSearch[index];
+  }
+  else {
+    expandedSearch[index] = true;
+  }
+};
+const getSearchResults = (searchResultsStr) => {
+  if (!searchResultsStr) {
+    return [];
+  }
+  try {
+    const results = JSON.parse(searchResultsStr);
+    if (Array.isArray(results)) {
+      return results;
+    }
+  } catch (e) {
+    console.error('解析搜索结果失败:', e);
+  }
+  return [];
 };
 const openImagePreview = (url) => {
  previewImage.value = url;
@@ -298,7 +322,7 @@ const sendMessage = async () => {
     mediaUrl: capturedUrls ? capturedUrls[0] : null,
     fileNames: finalFileNames
   });
-  const botMessageIndex = messages.value.push({ type: 'bot', content: '' }) - 1;
+  const botMessageIndex = messages.value.push({ type: 'bot', content: '', searchResults: null }) - 1;
   isLoading.value = true;
   scrollToBottom();
   try {
@@ -338,13 +362,58 @@ const sendMessage = async () => {
  }
  const reader = response.body.getReader();
  const decoder = new TextDecoder();
+ let lineBuffer = '';
  try {
  while (true) {
  const { done, value } = await reader.read();
  if (done)
  break;
- messages.value[botMessageIndex].content += decoder.decode(value, { stream: true });
+ lineBuffer += decoder.decode(value, { stream: true });
+ let newlineIdx;
+ while ((newlineIdx = lineBuffer.indexOf('\n')) >= 0) {
+ const line = lineBuffer.substring(0, newlineIdx).trim();
+ lineBuffer = lineBuffer.substring(newlineIdx + 1);
+ if (!line)
+ continue;
+ if (line.startsWith('{')) {
+ try {
+ const jsonChunk = JSON.parse(line);
+ if (jsonChunk.type === 'content') {
+ messages.value[botMessageIndex].content += jsonChunk.data;
+ }
+ else if (jsonChunk.type === 'search_results') {
+ messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data);
+ }
+ }
+ catch (e) {
+ messages.value[botMessageIndex].content += line;
+ }
+ }
+ else {
+ messages.value[botMessageIndex].content += line;
+ }
  scrollToBottom();
+ }
+ }
+ const remaining = lineBuffer.trim();
+ if (remaining) {
+ if (remaining.startsWith('{')) {
+ try {
+ const jsonChunk = JSON.parse(remaining);
+ if (jsonChunk.type === 'content') {
+ messages.value[botMessageIndex].content += jsonChunk.data;
+ }
+ else if (jsonChunk.type === 'search_results') {
+ messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data);
+ }
+ }
+ catch (e) {
+ messages.value[botMessageIndex].content += remaining;
+ }
+ }
+ else {
+ messages.value[botMessageIndex].content += remaining;
+ }
  }
  } finally {
  reader.releaseLock();
@@ -684,6 +753,34 @@ const processAudio = async (audioBlob) => {
 
               <template v-else>
                 <span class="message-text">{{ msg.content }}</span>
+                <div v-if="msg.searchResults && getSearchResults(msg.searchResults).length > 0" class="search-container">
+                  <button class="search-toggle" @click="toggleSearch(index)">
+                    <svg v-if="!expandedSearch[index]" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <circle cx="11" cy="11" r="8"/>
+                      <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <line x1="18" y1="6" x2="6" y2="18"/>
+                      <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                    <span>{{ expandedSearch[index] ? '收起搜索结果' : '查看搜索结果' }}</span>
+                  </button>
+                  <div v-if="expandedSearch[index]" class="search-content-box">
+                    <span class="search-label">【搜索结果】</span>
+                    <div class="search-list">
+                      <a v-for="(result, idx) in getSearchResults(msg.searchResults)" :key="idx" :href="result.url" target="_blank" class="search-item">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                          <polyline points="16 18 22 12 16 6"/>
+                          <line x1="22" y1="12" x2="10" y2="12"/>
+                        </svg>
+                        <div class="search-item-content">
+                          <span class="search-item-title">{{ result.title }}</span>
+                          <span class="search-item-url">{{ result.url }}</span>
+                        </div>
+                      </a>
+                    </div>
+                  </div>
+                </div>
               </template>
             </div>
           </div>
@@ -1100,6 +1197,83 @@ const processAudio = async (audioBlob) => {
   word-break: break-all; 
   font-size: 14px;
   line-height: 1.7;
+}
+
+.search-container {
+  margin-top: 12px;
+}
+.search-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #64748b;
+  transition: all 0.2s;
+}
+.search-toggle:hover {
+  background: #e2e8f0;
+  color: #334155;
+}
+.search-content-box {
+  margin-top: 8px;
+  padding: 14px;
+  background-color: #f8fafc;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  animation: fadeIn 0.2s;
+}
+.search-label { 
+  color: #64748b; 
+  font-weight: 600; 
+  display: block; 
+  margin-bottom: 10px; 
+  font-size: 12px;
+}
+.search-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.search-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  background: white;
+  border-radius: 8px;
+  text-decoration: none;
+  color: #3b82f6;
+  font-size: 14px;
+  transition: all 0.2s;
+  border: 1px solid #e2e8f0;
+}
+.search-item:hover {
+  background: #dbeafe;
+  border-color: #3b82f6;
+  transform: translateX(4px);
+}
+.search-item-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.search-item-title {
+  font-weight: 600;
+  color: #1e40af;
+  font-size: 14px;
+}
+.search-item-url {
+  font-size: 12px;
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-input-area {

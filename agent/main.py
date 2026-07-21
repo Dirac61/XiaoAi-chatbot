@@ -20,6 +20,7 @@ logger = logging.getLogger("XiaoAi Agent")
 load_dotenv()
 
 from services.memory_service import memory_service
+from services.search_service import search_service
 
 
 @asynccontextmanager
@@ -44,30 +45,55 @@ OCR_MODEL = os.getenv("OCR_MODEL") or MULTIMODAL_MODEL
 OCR_API_KEY = os.getenv("OCR_API_KEY") or MULTIMODAL_API_KEY
 OCR_API_BASE = os.getenv("OCR_API_BASE") or MULTIMODAL_API_BASE
 
+ORCHESTRATION_MODEL = os.getenv("ORCHESTRATION_MODEL") or MODEL
+ORCHESTRATION_API_KEY = os.getenv("ORCHESTRATION_API_KEY") or API_KEY
+ORCHESTRATION_API_BASE = os.getenv("ORCHESTRATION_API_BASE") or API_BASE
+
 logger.info(f"文本模型 - API_KEY: {'是' if API_KEY else '否'}, 模型: {MODEL}, 地址: {API_BASE}")
 logger.info(f"多模态模型 - API_KEY: {'是' if MULTIMODAL_API_KEY else '否'}, 模型: {MULTIMODAL_MODEL}, 地址: {MULTIMODAL_API_BASE}, 启用: {'是' if USE_MULTIMODAL else '否'}")
 logger.info(f"OCR模型 - API_KEY: {'是' if OCR_API_KEY else '否'}, 模型: {OCR_MODEL}, 地址: {OCR_API_BASE}")
+logger.info(f"编排器模型 - API_KEY: {'是' if ORCHESTRATION_API_KEY else '否'}, 模型: {ORCHESTRATION_MODEL}, 地址: {ORCHESTRATION_API_BASE}")
 
+# 主聊天模型 client
+# timeout: 读取超时 60s（覆盖大模型首 token 响应），connect 10s（正常握手 1~2s 足够）
+# max_retries=0: 禁用 AsyncOpenAI 内置重试，避免单次超时被放大为 3 倍时长，失败由业务层处理
 client = AsyncOpenAI(
     api_key=API_KEY,
     base_url=API_BASE,
-    timeout=httpx.Timeout(60.0, connect=30.0)
+    timeout=httpx.Timeout(60.0, connect=10.0),
+    max_retries=0
 )
 
+# 多模态模型 client（配置策略同主 client）
 multimodal_client = None
 if MULTIMODAL_API_KEY and MULTIMODAL_API_BASE:
     multimodal_client = AsyncOpenAI(
         api_key=MULTIMODAL_API_KEY,
         base_url=MULTIMODAL_API_BASE,
-        timeout=httpx.Timeout(60.0, connect=30.0)
+        timeout=httpx.Timeout(60.0, connect=10.0),
+        max_retries=0
     )
 
+# OCR 模型 client（配置策略同主 client）
 ocr_client = None
 if OCR_API_KEY and OCR_API_BASE:
     ocr_client = AsyncOpenAI(
         api_key=OCR_API_KEY,
         base_url=OCR_API_BASE,
-        timeout=httpx.Timeout(60.0, connect=30.0)
+        timeout=httpx.Timeout(60.0, connect=10.0),
+        max_retries=0
+    )
+
+# 编排器小模型 client
+# timeout: 读取 30s（编排器只输出 JSON，响应应较快），connect 10s
+# max_retries=0: 禁用重试，失败时直接走 fallback（need_search=False），不拖累主流程
+orchestration_client = None
+if ORCHESTRATION_API_KEY and ORCHESTRATION_API_BASE:
+    orchestration_client = AsyncOpenAI(
+        api_key=ORCHESTRATION_API_KEY,
+        base_url=ORCHESTRATION_API_BASE,
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        max_retries=0
     )
 
 from typing import List, Optional
@@ -77,7 +103,7 @@ class ChatRequest(BaseModel):
     message: str
     history: Optional[List[dict]] = None
     user_id: Optional[int] = None
-    session_id: Optional[int] = None
+    session_id: Optional[str] = None
     message_type: Optional[str] = "TEXT"
     media_url: Optional[str] = None
     media_urls: Optional[List[str]] = None
@@ -396,6 +422,27 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
     
     logger.info(f"检索到 {len(memories)} 条相关记忆")
 
+    search_results = []
+    search_context = ""
+    
+    context_text = message
+    if extracted_text:
+        context_text += f"\n{extracted_text}"
+    if memories:
+        memories_text = "\n".join([f"- {m['content']}" for m in memories])
+        context_text += f"\n\n相关记忆：\n{memories_text}"
+
+    orchestration_result = await _call_orchestration_model(context_text, message)
+    if orchestration_result:
+        need_search = orchestration_result.get("need_search", False)
+        search_keywords = orchestration_result.get("search_keywords", [])
+        
+        logger.info(f"编排器结果: need_search={need_search}, keywords={search_keywords}")
+        
+        if need_search and search_keywords:
+            search_results = await search_service.web_search(search_keywords)
+            search_context = await search_service.get_search_context(search_keywords)
+
     system_prompt = """你是爱尔奎特·布伦史塔德，高贵的真祖，月之公主，吸血鬼中的最高存在。
 
 【身份设定】
@@ -412,6 +459,9 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
     if memories:
         memories_text = "\n".join([f"- {m['content']}" for m in memories])
         system_prompt += f"\n\n用户长期记忆：\n{memories_text}"
+
+    if search_context:
+        system_prompt += f"\n\n联网搜索信息：\n{search_context}"
 
     messages = [{"role": "system", "content": system_prompt}]
 
@@ -503,7 +553,8 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
                     total_content += content
                     assistant_response += content
                     logger.debug(f"分片 {chunk_count}: '{content}'")
-                    yield content
+                    import json
+                    yield json.dumps({"type": "content", "data": content}, ensure_ascii=False) + "\n"
 
         end_time = time.time()
         duration = end_time - start_time
@@ -511,6 +562,11 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
 
         if chunk_count == 0:
             logger.warning("未收到模型返回的内容")
+
+        if search_results:
+            import json
+            yield json.dumps({"type": "search_results", "data": search_results}, ensure_ascii=False) + "\n"
+            logger.info(f"已通过流式响应返回搜索结果: {len(search_results)}条")
 
     except Exception as e:
         logger.error(f"调用模型API出错: {str(e)}")
@@ -546,6 +602,9 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
                 logger.info("消息内容回写完成！")
             else:
                 logger.warning("消息内容回写跳过：message_uuid为空")
+            
+            if search_results:
+                logger.info(f"搜索结果已通过流式响应返回，无需单独保存: {len(search_results)}条")
         else:
             asyncio.create_task(
                 memory_service.async_extract_and_store(
@@ -553,6 +612,187 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
                 )
             )
             logger.info("已调度异步记忆提取和存储")
+            
+            if search_results:
+                logger.info(f"搜索结果已通过流式响应返回，无需单独保存: {len(search_results)}条")
+
+
+async def _call_orchestration_model(context_text: str, message: str) -> dict:
+    """
+    调用编排器小模型，判断是否需要联网搜索，并生成搜索关键词
+    :param context_text: 上下文文本（包含用户提问、提取的媒体文本、相关记忆）
+    :param message: 用户原始提问
+    :return: 编排结果字典，包含need_search和search_keywords
+    """
+    if not orchestration_client:
+        logger.warning("编排器client未初始化，跳过编排")
+        return {"need_search": False, "search_keywords": [], "analysis_text": "编排器未初始化"}
+    
+    import time
+    start_time = time.time()
+    logger.info(f"开始调用编排器小模型({ORCHESTRATION_MODEL})，上下文长度: {len(context_text)}")
+    
+    system_prompt = """你是一个智能编排器，负责分析用户问题和上下文，决定是否需要联网搜索。
+
+【输出格式】
+必须输出严格的JSON格式，包含以下字段：
+- need_search: 布尔值，是否需要联网搜索
+- search_keywords: 字符串数组，搜索关键词列表（最多5个）
+- analysis_text: 对问题的简要分析（用于调试）
+
+【判断规则】
+- 需要最新信息（新闻、事件、数据、当前状态）→ need_search: true
+- 需要专业知识但不确定准确性 → 需要搜索验证
+- 关于人物、地点、事件的最新信息 → 需要搜索
+- 纯聊天、情感交流、已有记忆足够回答 → need_search: false
+- 已有记忆中的信息可以直接回答 → need_search: false
+
+【示例】
+{"need_search": true, "search_keywords": ["2024年人工智能发展", "AI最新技术"], "analysis_text": "用户询问最新AI发展情况，需要获取最新信息"}
+{"need_search": false, "search_keywords": [], "analysis_text": "用户询问已有记忆中的内容，无需搜索"}"""
+
+    user_prompt = f"""用户提问：{message}
+
+上下文信息：
+{context_text[:2000]}
+
+请分析是否需要联网搜索，并生成搜索关键词。"""
+
+    max_retries = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = await orchestration_client.chat.completions.create(
+                model=ORCHESTRATION_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                stream=False,
+                temperature=0.3
+            )
+
+            end_time = time.time()
+            duration = end_time - start_time
+
+            if response.choices and response.choices[0].message and response.choices[0].message.content:
+                content = response.choices[0].message.content.strip()
+                logger.debug(f"编排器响应(第{attempt}次): {content}")
+                
+                content = _clean_json_response(content)
+                logger.debug(f"清理后内容: {content}")
+                
+                try:
+                    result = json.loads(content)
+                    if isinstance(result, dict):
+                        need_search = result.get("need_search", False)
+                        search_keywords = result.get("search_keywords", [])
+                        analysis_text = result.get("analysis_text", "")
+                        logger.info(f"编排器运行完成({ORCHESTRATION_MODEL})，耗时={duration:.2f}秒, need_search={need_search}, keywords={search_keywords}")
+                        return {
+                            "need_search": need_search,
+                            "search_keywords": search_keywords,
+                            "analysis_text": analysis_text
+                        }
+                except json.JSONDecodeError as je:
+                    logger.warning(f"第{attempt}次调用JSON解析失败: {je}, 内容='{content[:200]}'")
+                    if attempt < max_retries:
+                        logger.info(f"准备重试编排器调用...")
+                        user_prompt = f"""用户提问：{message}
+
+上下文信息：
+{context_text[:2000]}
+
+请分析是否需要联网搜索，并生成搜索关键词。
+
+【强制要求】
+必须输出严格的JSON格式，不要包含任何markdown代码块标记（如```json），不要包含任何解释文字。
+只输出JSON对象：{"need_search": true/false, "search_keywords": [...], "analysis_text": "..."}"""
+                    continue
+        except Exception as e:
+            end_time = time.time()
+            duration = end_time - start_time
+            logger.error(f"第{attempt}次调用编排器小模型失败({ORCHESTRATION_MODEL})，耗时={duration:.2f}秒: {e}")
+            if attempt < max_retries:
+                logger.info(f"准备重试编排器调用...")
+                continue
+
+    end_time = time.time()
+    duration = end_time - start_time
+    logger.error(f"调用编排器小模型失败({ORCHESTRATION_MODEL})，已重试{max_retries}次，总耗时={duration:.2f}秒")
+    return {"need_search": False, "search_keywords": [], "analysis_text": "编排器调用失败"}
+
+
+def _clean_json_response(content: str) -> str:
+    """
+    清理模型返回的JSON响应，去除markdown代码块标记和多余内容
+    :param content: 原始响应内容
+    :return: 清理后的JSON字符串
+    """
+    if not content:
+        return content
+    
+    content = content.strip()
+    
+    # 去除markdown代码块标记
+    if content.startswith("```"):
+        # 找到第一个和最后一个```之间的内容
+        first_backtick = content.find("```")
+        last_backtick = content.rfind("```")
+        if first_backtick != last_backtick:
+            content = content[first_backtick + 3:last_backtick]
+        else:
+            content = content[3:]
+    
+    # 如果开头有json标记，去掉
+    content = content.strip()
+    if content.startswith("json"):
+        content = content[4:].strip()
+    
+    # 使用正则提取最外层的{}包裹的JSON对象
+    import re
+    json_match = re.search(r'\{[\s\S]*\}', content)
+    if json_match:
+        content = json_match.group(0)
+    
+    # 去除首尾空白字符和换行
+    return content.strip()
+
+
+async def update_backend_search_results(session_id: int, message_uuid: str, search_results: list):
+    """
+    调用后端接口更新消息搜索结果
+    :param session_id: 会话ID
+    :param message_uuid: 消息唯一标识
+    :param search_results: 搜索结果列表（包含title和url）
+    """
+    backend_url = os.getenv("BACKEND_URL", "http://localhost:8080")
+    internal_secret = os.getenv("INTERNAL_SECRET", "")
+    update_url = f"{backend_url}/api/message/update-search-results"
+    
+    try:
+        import json
+        search_results_json = json.dumps(search_results, ensure_ascii=False)
+        
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.post(
+                update_url,
+                json={
+                    "session_id": session_id,
+                    "message_uuid": message_uuid,
+                    "search_results": search_results_json
+                },
+                headers={
+                    "X-Internal-Secret": internal_secret
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"搜索结果保存成功: session_id={session_id}, message_uuid={message_uuid}, count={len(search_results)}")
+            else:
+                logger.error(f"搜索结果保存失败: status={response.status_code}, {response.text}")
+    except Exception as e:
+        logger.error(f"调用后端更新搜索结果失败: {str(e)}")
 
 
 async def update_backend_message_content(session_id: int, message_uuid: str, message: str, extracted_text: str):
@@ -564,6 +804,7 @@ async def update_backend_message_content(session_id: int, message_uuid: str, mes
     :param extracted_text: 提取后的文本内容
     """
     backend_url = os.getenv("BACKEND_URL", "http://localhost:8080")
+    internal_secret = os.getenv("INTERNAL_SECRET", "")
     update_url = f"{backend_url}/api/message/update-content"
     
     try:
@@ -575,6 +816,9 @@ async def update_backend_message_content(session_id: int, message_uuid: str, mes
                     "message_uuid": message_uuid,
                     "message": message,
                     "extracted_text": extracted_text
+                },
+                headers={
+                    "X-Internal-Secret": internal_secret
                 },
                 timeout=30.0
             )
@@ -713,16 +957,23 @@ async def summarize(request: SummarizeRequest):
         return {"summary": ""}
 
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from qdrant_client import models as qdrant_models
 from config.settings import QDRANT_COLLECTION
 
 class DeleteMemoryRequest(BaseModel):
-    session_id: int
+    session_id: str
 
 @app.delete("/memory/delete")
-async def delete_memory(request: DeleteMemoryRequest):
-    logger.info(f"收到删除记忆请求: sessionId={request.session_id}")
+async def delete_memory(request: DeleteMemoryRequest, request_obj: Request):
+    internal_secret = os.getenv("INTERNAL_SECRET", "")
+    header_secret = request_obj.headers.get("X-Internal-Secret", "")
+    
+    if not internal_secret or not header_secret or not header_secret == internal_secret:
+        logger.warning(f"内部接口认证失败: /memory/delete, sessionId={request.session_id}")
+        raise HTTPException(status_code=403, detail="内部接口认证失败")
+    
+    logger.info(f"收到删除记忆请求: sessionId={request.session_id}, 类型={type(request.session_id)}")
     
     try:
         if not memory_service._initialized:
@@ -736,7 +987,7 @@ async def delete_memory(request: DeleteMemoryRequest):
                 filter=qdrant_models.Filter(
                     must=[qdrant_models.FieldCondition(
                         key="sessionId",
-                        match=qdrant_models.MatchValue(value=request.session_id)
+                        match=qdrant_models.MatchValue(value=str(request.session_id))
                     )]
                 )
             )

@@ -6,6 +6,7 @@ import com.example.xiaoi.service.ASRService;
 import com.example.xiaoi.service.OSSUploadService;
 import com.example.xiaoi.service.SessionService;
 import com.example.xiaoi.utils.SnowflakeUtil;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -121,7 +122,7 @@ public class ChatController {
         requestBody.put("message", request.getMessage());
         requestBody.put("history", history);
         requestBody.put("user_id", userId);
-        requestBody.put("session_id", sessionId);
+        requestBody.put("session_id", String.valueOf(sessionId));
         requestBody.put("message_type", messageType);
         requestBody.put("media_url", firstMediaUrl);
         if (request.getMediaUrls() != null && !request.getMediaUrls().isEmpty()) {
@@ -131,6 +132,8 @@ public class ChatController {
 
         return outputStream -> {
             StringBuilder responseBuilder = new StringBuilder();
+            StringBuilder searchResultsBuilder = new StringBuilder();
+            StringBuilder lineBuffer = new StringBuilder();
             CountDownLatch latch = new CountDownLatch(1);
             Disposable disposable = null;
 
@@ -161,9 +164,47 @@ public class ChatController {
                             
                             logger.debug("收到 agent 数据块 {}: '{}'", currentCount, chunk);
                             
-                            responseBuilder.append(chunk);
-                            outputStream.write(bytes);
-                            outputStream.flush();
+                            lineBuffer.append(chunk);
+                            String bufferStr = lineBuffer.toString();
+                            lineBuffer.setLength(0);
+                            int newlineIdx = bufferStr.indexOf('\n');
+                            
+                            while (newlineIdx >= 0) {
+                                String line = bufferStr.substring(0, newlineIdx).trim();
+                                bufferStr = bufferStr.substring(newlineIdx + 1);
+                                newlineIdx = bufferStr.indexOf('\n');
+                                
+                                if (!line.isEmpty()) {
+                                    String contentToWrite = line;
+                                    if (line.startsWith("{")) {
+                                        try {
+                                            Map<String, Object> jsonChunk = objectMapper.readValue(line, 
+                                                new TypeReference<Map<String, Object>>() {});
+                                            String type = (String) jsonChunk.get("type");
+                                            if ("content".equals(type)) {
+                                                String content = (String) jsonChunk.get("data");
+                                                responseBuilder.append(content);
+                                            } else if ("search_results".equals(type)) {
+                                                Object data = jsonChunk.get("data");
+                                                String searchResults = objectMapper.writeValueAsString(data);
+                                                searchResultsBuilder.append(searchResults);
+                                                logger.info("从流式响应中提取搜索结果: {}", searchResults.length());
+                                            }
+                                        } catch (Exception e) {
+                                            logger.debug("解析JSON line失败，当作普通内容处理: {}", e.getMessage());
+                                            responseBuilder.append(line);
+                                        }
+                                    } else {
+                                        responseBuilder.append(line);
+                                    }
+                                    
+                                    outputStream.write(line.getBytes(StandardCharsets.UTF_8));
+                                    outputStream.write('\n');
+                                    outputStream.flush();
+                                }
+                            }
+                            
+                            lineBuffer.append(bufferStr);
                         } catch (IOException e) {
                             logger.error("写入输出流失败: {}", e.getMessage());
                         }
@@ -173,6 +214,37 @@ public class ChatController {
                         latch.countDown();
                     },
                     () -> {
+                        String remaining = lineBuffer.toString().trim();
+                        if (!remaining.isEmpty()) {
+                            if (remaining.startsWith("{")) {
+                                try {
+                                    Map<String, Object> jsonChunk = objectMapper.readValue(remaining, 
+                                        new TypeReference<Map<String, Object>>() {});
+                                    String type = (String) jsonChunk.get("type");
+                                    if ("content".equals(type)) {
+                                        String content = (String) jsonChunk.get("data");
+                                        responseBuilder.append(content);
+                                    } else if ("search_results".equals(type)) {
+                                        Object data = jsonChunk.get("data");
+                                        String searchResults = objectMapper.writeValueAsString(data);
+                                        searchResultsBuilder.append(searchResults);
+                                        logger.info("从流式响应中提取搜索结果(结束): {}", searchResults.length());
+                                    }
+                                } catch (Exception e) {
+                                    logger.debug("解析剩余JSON失败，当作普通内容处理: {}", e.getMessage());
+                                    responseBuilder.append(remaining);
+                                }
+                            } else {
+                                responseBuilder.append(remaining);
+                            }
+                            
+                            try {
+                                outputStream.write(remaining.getBytes(StandardCharsets.UTF_8));
+                                outputStream.write('\n');
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        }
                         logger.info("流传输完成，收到 {} 个数据块，总响应长度: {} 字符", chunkCount.get(), responseBuilder.length());
                         latch.countDown();
                     }
@@ -201,9 +273,19 @@ public class ChatController {
                 assistantMessage.put("messageType", "TEXT");
                 assistantMessage.put("mediaUrl", null);
                 assistantMessage.put("timestamp", System.currentTimeMillis());
+                assistantMessage.put("messageUuid", messageUuid);
+                
+                if (searchResultsBuilder.length() > 0) {
+                    String searchResults = searchResultsBuilder.toString();
+                    assistantMessage.put("searchResults", searchResults);
+                    logger.info("聊天请求完成 - sessionId: {}, messageUuid: {}, 响应长度: {} 字符, 搜索结果: {} 字符", 
+                        sessionId, messageUuid, responseBuilder.length(), searchResults.length());
+                } else {
+                    logger.info("聊天请求完成 - sessionId: {}, messageUuid: {}, 响应长度: {} 字符", 
+                        sessionId, messageUuid, responseBuilder.length());
+                }
+                
                 sessionService.saveMessage(sessionId, assistantMessage, "TEXT", null);
-                logger.info("聊天请求完成 - sessionId: {}, 响应长度: {} 字符", 
-                    sessionId, responseBuilder.length());
             } else {
                 logger.warn("聊天请求无有效响应 - sessionId: {}", sessionId);
             }
@@ -412,6 +494,28 @@ public class ChatController {
             logger.error("更新消息内容失败: {}", e.getMessage());
             result.put("code", 500);
             result.put("message", "更新消息内容失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(result);
+        }
+    }
+
+    @PostMapping("/message/update-search-results")
+    public ResponseEntity<Map<String, Object>> updateMessageSearchResults(@RequestBody Map<String, Object> request) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            Long sessionId = Long.parseLong(request.get("session_id").toString());
+            String messageUuid = (String) request.get("message_uuid");
+            String searchResults = (String) request.get("search_results");
+            
+            sessionService.updateMessageSearchResults(sessionId, messageUuid, searchResults);
+            
+            result.put("code", 200);
+            result.put("message", "消息搜索结果更新成功");
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            logger.error("更新消息搜索结果失败: {}", e.getMessage());
+            result.put("code", 500);
+            result.put("message", "更新消息搜索结果失败: " + e.getMessage());
             return ResponseEntity.internalServerError().body(result);
         }
     }

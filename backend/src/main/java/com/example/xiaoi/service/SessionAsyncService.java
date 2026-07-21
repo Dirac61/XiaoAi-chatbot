@@ -51,6 +51,9 @@ public class SessionAsyncService {
     @Value("${agent.url:http://localhost:8000}")
     private String agentUrl;
 
+    @Value("${internal.secret:xiaoi-internal-api-secret-2026}")
+    private String internalSecret;
+
     private static final String REDIS_SUMMARY_PREFIX = "session:summary:";
     private static final long REDIS_EXPIRE_DAYS = 1;
     private static final int MAX_SUMMARY_LENGTH = 500;
@@ -73,6 +76,7 @@ public class SessionAsyncService {
             sessionDetail.setMediaUrl(mediaUrl);
             sessionDetail.setCreatedAt(LocalDateTime.now());
             sessionDetail.setUpdatedAt(LocalDateTime.now());
+            
             sessionDetailMapper.insert(sessionDetail);
 
             Session session = new Session();
@@ -220,6 +224,8 @@ public class SessionAsyncService {
         }
     }
 
+    
+
     /**
      * 异步删除 Qdrant 中的记忆数据
      * 调用 Agent 的删除记忆接口
@@ -229,7 +235,9 @@ public class SessionAsyncService {
     public void asyncDeleteQdrantMemory(Long sessionId) {
         try {
             Map<String, Object> requestBody = new HashMap<>();
-            requestBody.put("session_id", sessionId);
+            // session_id 必须以字符串形式传递，与 Qdrant 中存储的格式保持一致
+            // 避免因类型不匹配导致删除失败（字符串 "123" 与整数 123 在 Qdrant MatchValue 中不匹配）
+            requestBody.put("session_id", String.valueOf(sessionId));
             
             String jsonBody = objectMapper.writeValueAsString(requestBody);
             String urlStr = agentUrl + "/memory/delete";
@@ -239,6 +247,7 @@ public class SessionAsyncService {
             conn.setRequestMethod("DELETE");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Accept", "application/json");
+            conn.setRequestProperty("X-Internal-Secret", internalSecret);
             conn.setDoOutput(true);
             conn.setConnectTimeout(30000);
             conn.setReadTimeout(60000);
@@ -256,6 +265,8 @@ public class SessionAsyncService {
             } else {
                 logger.warn("Qdrant记忆删除失败: sessionId={}, status={}", sessionId, status);
             }
+            
+            logger.debug("删除请求体: {}", jsonBody);
         } catch (Exception e) {
             logger.error("异步删除Qdrant记忆失败: sessionId={}, 错误={}", sessionId, e.getMessage());
         }
