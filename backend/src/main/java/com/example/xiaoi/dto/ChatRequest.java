@@ -22,4 +22,6 @@ public class ChatRequest {
     private String mediaUrl;
     /** 媒体文件地址列表（支持多文件上传） */
     private List<String> mediaUrls;
+    /** 模式：fast（快速模式）/ expert（专家模式），默认fast */
+    private String mode = "fast";
 }
