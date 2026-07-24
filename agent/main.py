@@ -988,6 +988,7 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
         need_deep_thinking = orchestration_result.get("need_deep_thinking", False)
         need_more_info = orchestration_result.get("need_more_info", False)
         search_keywords = orchestration_result.get("search_keywords", [])
+        analysis_text = orchestration_result.get("analysis_text", "")
         
         # 关键修复：如果需要调用工具，强制继续迭代，确保工具结果被编排器看到后再生成回复
         if need_search or need_deep_thinking:
@@ -1000,7 +1001,7 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
             logger.info(f"[专家模式][最后迭代] 强制生成最终回复")
         
         logger.info(f"[专家模式][编排器结果] need_search={need_search}, need_deep_thinking={need_deep_thinking}, "
-                    f"need_more_info={need_more_info}, keywords={search_keywords}")
+                    f"need_more_info={need_more_info}, keywords={search_keywords}, analysis_text='{analysis_text}'")
         
         # 调用联网搜索
         if need_search and search_keywords:
@@ -1070,9 +1071,17 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
     # 5. 构建最终响应 - 使用流式调用来生成回复内容
     logger.info(f"[专家模式][流式回复] 开始流式生成回复内容")
     
+    assistant_response = ""
     async for chunk in _stream_expert_reply(message, context_text, extracted_text, 
                                             tool_results, search_results, history):
         yield chunk
+        # 收集完整回复内容用于记忆持久化
+        if chunk.strip().startswith('{"type": "content"'):
+            try:
+                parsed = json.loads(chunk)
+                assistant_response += parsed.get("data", "")
+            except:
+                pass
     
     logger.info(f"[专家模式][流式回复] 完成")
     
@@ -1080,13 +1089,29 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
         yield json.dumps({"type": "search_results", "data": search_results}, ensure_ascii=False) + "\n"
         logger.info(f"[专家模式][搜索结果] 已通过流式响应返回: {len(search_results)}条")
     
-    # 异步保存记忆
-    if user_id:
-        asyncio.create_task(
-            memory_service.async_extract_and_store(
-                message, "", user_id, session_id
+    # 异步保存记忆（包含图片提取内容和完整回复）
+    if user_id and assistant_response:
+        if extracted_text:
+            # 如果有图片/文件提取内容，组合用户消息和提取内容
+            combined_content = f"[用户提问]{message}\n[图片内容]{extracted_text}" if message_type == "IMAGE" else f"[用户提问]{message}\n[文件内容]{extracted_text}"
+            
+            asyncio.create_task(
+                memory_service.async_extract_and_store(
+                    combined_content, assistant_response, user_id, session_id
+                )
             )
-        )
+            logger.info(f"[专家模式][记忆持久化] 已启动异步任务，包含图片提取内容，用户消息长度={len(message)}, 提取内容长度={len(extracted_text)}, 回复长度={len(assistant_response)}")
+            
+            # 回写图片提取内容到后端MySQL
+            if message_uuid:
+                await update_backend_message_content(session_id, message_uuid, message, extracted_text)
+        else:
+            asyncio.create_task(
+                memory_service.async_extract_and_store(
+                    message, assistant_response, user_id, session_id
+                )
+            )
+            logger.info(f"[专家模式][记忆持久化] 已启动异步任务，无图片提取内容，用户消息长度={len(message)}, 回复长度={len(assistant_response)}")
     
     total_duration = time.time() - request_start_time
     logger.info(f"{'='*60}")
