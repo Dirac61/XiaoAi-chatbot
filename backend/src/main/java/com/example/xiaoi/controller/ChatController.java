@@ -73,7 +73,7 @@ public class ChatController {
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     };
 
-    @PostMapping(value = "/chat", produces = MediaType.TEXT_PLAIN_VALUE)
+    @PostMapping(value = "/chat", produces = "text/event-stream;charset=UTF-8")
     public StreamingResponseBody chat(@RequestBody ChatRequest request, HttpServletResponse response) {
         Long userId = UserContext.getUserId();
         String messageType = request.getMessageType() != null ? request.getMessageType() : "TEXT";
@@ -129,6 +129,7 @@ public class ChatController {
             requestBody.put("media_urls", request.getMediaUrls());
         }
         requestBody.put("message_uuid", messageUuid);
+        requestBody.put("mode", request.getMode() != null ? request.getMode() : "fast");
 
         return outputStream -> {
             StringBuilder responseBuilder = new StringBuilder();

@@ -1,6 +1,13 @@
 <script setup>import { nextTick, onMounted, ref, reactive, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import service from '../api/index.js';
+import { marked } from 'marked';
+
+// Markdown渲染函数
+const renderMarkdown = (text) => {
+  if (!text) return '';
+  return marked(text, { breaks: true });
+};
 const router = useRouter();
 const currentUser = ref('');
 const messages = ref([
@@ -40,6 +47,8 @@ const sessionToDelete = ref(null);
 const expandedExtracted = reactive({});
 const expandedSearch = reactive({});
 const previewImage = ref(null);
+// 模式切换：fast（快速模式）, expert（专家模式）
+const currentMode = ref('fast');
 const imageLoaded = () => {
  setTimeout(() => {
  const container = chatContainer.value;
@@ -322,7 +331,7 @@ const sendMessage = async () => {
     mediaUrl: capturedUrls ? capturedUrls[0] : null,
     fileNames: finalFileNames
   });
-  const botMessageIndex = messages.value.push({ type: 'bot', content: '', searchResults: null }) - 1;
+  const botMessageIndex = messages.value.push({ type: 'bot', content: '', searchResults: null, thinking: '', isThinking: false, searchStatus: null }) - 1;
   isLoading.value = true;
   scrollToBottom();
   try {
@@ -330,7 +339,8 @@ const sendMessage = async () => {
     const requestBody = {
       message: hasPending ? (capturedText || finalFileNames.join(', ')) : capturedText,
       messageType: capturedType,
-      sessionId: currentSessionId.value
+      sessionId: currentSessionId.value,
+      mode: currentMode.value  // 添加模式参数
     };
     if (capturedUrls && capturedUrls.length > 0) {
       if (capturedUrls.length === 1) {
@@ -379,10 +389,53 @@ const sendMessage = async () => {
  try {
  const jsonChunk = JSON.parse(line);
  if (jsonChunk.type === 'content') {
+ // 正式回复内容，清除思考状态
+ messages.value[botMessageIndex].isThinking = false;
  messages.value[botMessageIndex].content += jsonChunk.data;
  }
  else if (jsonChunk.type === 'search_results') {
  messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data);
+ }
+ else if (jsonChunk.type === 'search_start') {
+ // 搜索开始状态 - 清除思考状态（互斥）
+ messages.value[botMessageIndex].searchStatus = {
+ status: 'searching',
+ keywords: jsonChunk.data?.keywords || []
+ };
+ messages.value[botMessageIndex].isThinking = false;
+ messages.value[botMessageIndex].thinking = '';
+ }
+ else if (jsonChunk.type === 'search_summary') {
+ // 搜索摘要（包含搜索结果）
+ messages.value[botMessageIndex].searchStatus = {
+ status: 'completed',
+ keywords: jsonChunk.data?.keywords || [],
+ count: jsonChunk.data?.count || 0,
+ duration: jsonChunk.data?.duration || 0
+ };
+ // 同时保存搜索结果
+ if (jsonChunk.data?.results) {
+ messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data.results);
+ }
+ }
+ else if (jsonChunk.type === 'thinking_start') {
+ // 深度思考开始状态 - 清除搜索状态（互斥）
+ messages.value[botMessageIndex].isThinking = true;
+ messages.value[botMessageIndex].thinking = '';
+ // 如果正在搜索中，清除搜索状态
+ if (messages.value[botMessageIndex].searchStatus?.status === 'searching') {
+ messages.value[botMessageIndex].searchStatus = null;
+ }
+ }
+ else if (jsonChunk.type === 'thinking') {
+ // 思考过程（流式）
+ messages.value[botMessageIndex].isThinking = true;
+ messages.value[botMessageIndex].thinking += jsonChunk.data;
+ }
+ else if (jsonChunk.type === 'thinking_error') {
+ // 思考错误
+ messages.value[botMessageIndex].isThinking = false;
+ messages.value[botMessageIndex].thinking += `\n[思考错误] ${jsonChunk.data?.error || '未知错误'}`;
  }
  }
  catch (e) {
@@ -401,10 +454,40 @@ const sendMessage = async () => {
  try {
  const jsonChunk = JSON.parse(remaining);
  if (jsonChunk.type === 'content') {
+ messages.value[botMessageIndex].isThinking = false;
  messages.value[botMessageIndex].content += jsonChunk.data;
  }
  else if (jsonChunk.type === 'search_results') {
  messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data);
+ }
+ else if (jsonChunk.type === 'search_start') {
+ messages.value[botMessageIndex].searchStatus = {
+ status: 'searching',
+ keywords: jsonChunk.data?.keywords || []
+ };
+ }
+ else if (jsonChunk.type === 'search_summary') {
+ messages.value[botMessageIndex].searchStatus = {
+ status: 'completed',
+ keywords: jsonChunk.data?.keywords || [],
+ count: jsonChunk.data?.count || 0,
+ duration: jsonChunk.data?.duration || 0
+ };
+ if (jsonChunk.data?.results) {
+ messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data.results);
+ }
+ }
+ else if (jsonChunk.type === 'thinking_start') {
+ messages.value[botMessageIndex].isThinking = true;
+ messages.value[botMessageIndex].thinking = '';
+ }
+ else if (jsonChunk.type === 'thinking') {
+ messages.value[botMessageIndex].isThinking = true;
+ messages.value[botMessageIndex].thinking += jsonChunk.data;
+ }
+ else if (jsonChunk.type === 'thinking_error') {
+ messages.value[botMessageIndex].isThinking = false;
+ messages.value[botMessageIndex].thinking += `\n[思考错误] ${jsonChunk.data?.error || '未知错误'}`;
  }
  }
  catch (e) {
@@ -668,9 +751,25 @@ const processAudio = async (audioBlob) => {
         <span class="title">小爱</span>
       </div>
       <div class="header-right">
-        <span class="username">{{ currentUser }}</span>
-        <button class="logout-btn" @click="handleLogout">退出登录</button>
-      </div>
+          <div class="mode-selector">
+            <button 
+              :class="['mode-btn', { active: currentMode === 'fast' }]" 
+              @click="currentMode = 'fast'"
+              title="快速模式：直接响应，速度快"
+            >
+              ⚡ 快速模式
+            </button>
+            <button 
+              :class="['mode-btn', { active: currentMode === 'expert' }]" 
+              @click="currentMode = 'expert'"
+              title="专家模式：深度分析，支持联网搜索和图片分析"
+            >
+              🔬 专家模式
+            </button>
+          </div>
+          <span class="username">{{ currentUser }}</span>
+          <button class="logout-btn" @click="handleLogout">退出登录</button>
+        </div>
     </header>
 
     <div class="chat-body">
@@ -752,7 +851,34 @@ const processAudio = async (audioBlob) => {
               </template>
 
               <template v-else>
-                <span class="message-text">{{ msg.content }}</span>
+                <!-- 搜索状态和思考过程互斥显示 -->
+                <!-- 正在搜索时显示搜索状态 -->
+                <div v-if="msg.searchStatus?.status === 'searching'" class="search-status">
+                  <div class="search-status-searching">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" class="search-spinner">
+                      <circle cx="11" cy="11" r="8"/>
+                      <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    <span>正在搜索：{{ msg.searchStatus.keywords?.join(' ') }}</span>
+                  </div>
+                </div>
+                
+                <!-- 正在思考时显示思考过程（优先级高于搜索完成状态） -->
+                <div v-else-if="msg.isThinking && !msg.content" class="thinking-container">
+                  <div class="thinking-header">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" :class="{ 'thinking-spinner': msg.isThinking }">
+                      <circle cx="12" cy="12" r="10"/>
+                      <path d="M12 6v6l4 2"/>
+                    </svg>
+                    <span>思考中...</span>
+                  </div>
+                  <div class="thinking-content">{{ msg.thinking }}</div>
+                </div>
+                
+                <!-- 正式回复内容 -->
+                <span v-if="msg.content" class="message-text" v-html="renderMarkdown(msg.content)"></span>
+                
+                <!-- 搜索结果折叠面板 -->
                 <div v-if="msg.searchResults && getSearchResults(msg.searchResults).length > 0" class="search-container">
                   <button class="search-toggle" @click="toggleSearch(index)">
                     <svg v-if="!expandedSearch[index]" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
@@ -927,6 +1053,41 @@ const processAudio = async (audioBlob) => {
   background: rgba(255, 255, 255, 0.3); 
   transform: translateY(-2px);
   box-shadow: 0 4px 12px rgba(255, 255, 255, 0.2);
+}
+
+/* 模式选择器样式 */
+.mode-selector {
+  display: flex;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 4px;
+  border-radius: 20px;
+}
+
+.mode-btn {
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.8);
+  padding: 6px 14px;
+  border-radius: 16px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mode-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  color: white;
+}
+
+.mode-btn.active {
+  background: rgba(255, 255, 255, 0.25);
+  color: white;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
 .chat-body { flex: 1; display: flex; overflow: hidden; }
@@ -1197,6 +1358,62 @@ const processAudio = async (audioBlob) => {
   word-break: break-all; 
   font-size: 14px;
   line-height: 1.7;
+}
+
+/* 搜索状态样式 */
+.search-status {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.search-status-searching {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #f0f9ff;
+  color: #0369a1;
+}
+.search-status-completed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #f0fdf4;
+  color: #059669;
+}
+.search-spinner {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* 思考过程样式 */
+.thinking-container {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: #fef3c7;
+  border-radius: 8px;
+  border-left: 3px solid #f59e0b;
+}
+.thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #d97706;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.thinking-spinner {
+  animation: spin 1s linear infinite;
+}
+.thinking-content {
+  color: #92400e;
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
 }
 
 .search-container {

@@ -9,6 +9,8 @@ import httpx
 import logging
 import asyncio
 import json
+import time
+from typing import List, Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,13 +56,31 @@ logger.info(f"多模态模型 - API_KEY: {'是' if MULTIMODAL_API_KEY else '否'
 logger.info(f"OCR模型 - API_KEY: {'是' if OCR_API_KEY else '否'}, 模型: {OCR_MODEL}, 地址: {OCR_API_BASE}")
 logger.info(f"编排器模型 - API_KEY: {'是' if ORCHESTRATION_API_KEY else '否'}, 模型: {ORCHESTRATION_MODEL}, 地址: {ORCHESTRATION_API_BASE}")
 
+# === 专家模式配置 ===
+EXPERT_MODE_ENABLED = os.getenv("EXPERT_MODE_ENABLED", "false").lower() == "true"
+EXPERT_MAX_ITERATIONS = int(os.getenv("EXPERT_MAX_ITERATIONS", "3"))
+
+EXPERT_ORCHESTRATION_MODEL = os.getenv("EXPERT_ORCHESTRATION_MODEL", "")
+EXPERT_ORCHESTRATION_API_KEY = os.getenv("EXPERT_ORCHESTRATION_API_KEY", "")
+EXPERT_ORCHESTRATION_API_BASE = os.getenv("EXPERT_ORCHESTRATION_API_BASE", "")
+
+EXPERT_DEEP_THINKING_MODEL = os.getenv("EXPERT_DEEP_THINKING_MODEL", "")
+EXPERT_DEEP_THINKING_API_KEY = os.getenv("EXPERT_DEEP_THINKING_API_KEY", "")
+EXPERT_DEEP_THINKING_API_BASE = os.getenv("EXPERT_DEEP_THINKING_API_BASE", "")
+
+logger.info(f"专家模式 - 启用: {'是' if EXPERT_MODE_ENABLED else '否'}")
+logger.info(f"专家模式编排器 - API_KEY: {'是' if EXPERT_ORCHESTRATION_API_KEY else '否'}, 模型: {EXPERT_ORCHESTRATION_MODEL}, 地址: {EXPERT_ORCHESTRATION_API_BASE}")
+logger.info(f"深度思考模型 - API_KEY: {'是' if EXPERT_DEEP_THINKING_API_KEY else '否'}, 模型: {EXPERT_DEEP_THINKING_MODEL}, 地址: {EXPERT_DEEP_THINKING_API_BASE}")
+logger.info(f"专家模式最大迭代次数: {EXPERT_MAX_ITERATIONS}")
+logger.info(f"专家模式 - 编排器直接生成回复，不使用主模型")
+
 # 主聊天模型 client
-# timeout: 读取超时 60s（覆盖大模型首 token 响应），connect 10s（正常握手 1~2s 足够）
+# timeout: 读取超时 30s（覆盖大模型首 token 响应），connect 5s（正常握手 1~2s 足够）
 # max_retries=0: 禁用 AsyncOpenAI 内置重试，避免单次超时被放大为 3 倍时长，失败由业务层处理
 client = AsyncOpenAI(
     api_key=API_KEY,
     base_url=API_BASE,
-    timeout=httpx.Timeout(60.0, connect=10.0),
+    timeout=httpx.Timeout(30.0, connect=5.0),
     max_retries=0
 )
 
@@ -70,7 +90,7 @@ if MULTIMODAL_API_KEY and MULTIMODAL_API_BASE:
     multimodal_client = AsyncOpenAI(
         api_key=MULTIMODAL_API_KEY,
         base_url=MULTIMODAL_API_BASE,
-        timeout=httpx.Timeout(60.0, connect=10.0),
+        timeout=httpx.Timeout(30.0, connect=5.0),
         max_retries=0
     )
 
@@ -80,23 +100,44 @@ if OCR_API_KEY and OCR_API_BASE:
     ocr_client = AsyncOpenAI(
         api_key=OCR_API_KEY,
         base_url=OCR_API_BASE,
-        timeout=httpx.Timeout(60.0, connect=10.0),
+        timeout=httpx.Timeout(30.0, connect=5.0),
         max_retries=0
     )
 
 # 编排器小模型 client
-# timeout: 读取 30s（编排器只输出 JSON，响应应较快），connect 10s
+# timeout: 读取 15s（编排器只输出 JSON，响应应较快），connect 5s
 # max_retries=0: 禁用重试，失败时直接走 fallback（need_search=False），不拖累主流程
 orchestration_client = None
 if ORCHESTRATION_API_KEY and ORCHESTRATION_API_BASE:
     orchestration_client = AsyncOpenAI(
         api_key=ORCHESTRATION_API_KEY,
         base_url=ORCHESTRATION_API_BASE,
-        timeout=httpx.Timeout(30.0, connect=10.0),
+        timeout=httpx.Timeout(15.0, connect=5.0),
         max_retries=0
     )
 
-from typing import List, Optional
+# === 专家模式专用 client ===
+# 专家模式编排器 client（多模态模型，支持图片理解）
+expert_orchestration_client = None
+if EXPERT_ORCHESTRATION_API_KEY and EXPERT_ORCHESTRATION_API_BASE:
+    expert_orchestration_client = AsyncOpenAI(
+        api_key=EXPERT_ORCHESTRATION_API_KEY,
+        base_url=EXPERT_ORCHESTRATION_API_BASE,
+        timeout=httpx.Timeout(30.0, connect=5.0),
+        max_retries=0
+    )
+
+# 深度思考模型 client（多模态模型，接收图片URL进行分析）
+deep_thinking_client = None
+if EXPERT_DEEP_THINKING_API_KEY and EXPERT_DEEP_THINKING_API_BASE:
+    deep_thinking_client = AsyncOpenAI(
+        api_key=EXPERT_DEEP_THINKING_API_KEY,
+        base_url=EXPERT_DEEP_THINKING_API_BASE,
+        timeout=httpx.Timeout(60.0, connect=5.0),
+        max_retries=0
+    )
+
+# 专家模式主模型 client - 已移除，由编排器直接生成回复
 
 
 class ChatRequest(BaseModel):
@@ -108,6 +149,7 @@ class ChatRequest(BaseModel):
     media_url: Optional[str] = None
     media_urls: Optional[List[str]] = None
     message_uuid: Optional[str] = None
+    mode: Optional[str] = "fast"  # fast: 快速模式, expert: 专家模式
 
 
 class SummarizeRequest(BaseModel):
@@ -116,12 +158,7 @@ class SummarizeRequest(BaseModel):
 
 
 async def download_and_extract_docx(media_url: str) -> str:
-    """
-    下载并提取docx文件的文本和表格内容（不提取图像）
-    :param media_url: 文件URL
-    :return: 提取的文本内容，失败返回空字符串
-    """
-    logger.info(f"开始下载并提取DOCX文件: {media_url[:50]}...")
+    logger.info(f"[文件提取] 开始下载并提取DOCX文件: {media_url[:50]}...")
     
     try:
         import tempfile
@@ -140,7 +177,6 @@ async def download_and_extract_docx(media_url: str) -> str:
             doc = Document(temp_file_path)
             
             all_content = []
-            
             for paragraph in doc.paragraphs:
                 if paragraph.text.strip():
                     all_content.append(paragraph.text)
@@ -155,30 +191,25 @@ async def download_and_extract_docx(media_url: str) -> str:
                     all_content.append("\n".join(table_text))
             
             extracted_text = "\n".join(all_content)
-            logger.info(f"DOCX提取完成，段落数: {len(doc.paragraphs)}, 表格数: {len(doc.tables)}, 总字符数: {len(extracted_text)}")
+            logger.info(f"[文件提取] DOCX提取完成，段落数: {len(doc.paragraphs)}, 表格数: {len(doc.tables)}, 总字符数: {len(extracted_text)}")
             
             return extracted_text[:3000]
         except ImportError:
-            logger.warning("python-docx库未安装，无法提取DOCX内容")
+            logger.warning("[文件提取] python-docx库未安装，无法提取DOCX内容")
             return ""
         except Exception as e:
-            logger.error(f"提取DOCX内容失败: {str(e)}")
+            logger.error(f"[文件提取] 提取DOCX内容失败: {str(e)}")
             return ""
         finally:
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
     except Exception as e:
-        logger.error(f"下载DOCX文件失败: {str(e)}")
+        logger.error(f"[文件提取] 下载DOCX文件失败: {str(e)}")
         return ""
 
 
 async def download_and_extract_pdf(media_url: str) -> str:
-    """
-    下载并提取PDF文件的文本内容
-    :param media_url: 文件URL
-    :return: 提取的文本内容，失败返回空字符串
-    """
-    logger.info(f"开始下载并提取PDF文件: {media_url[:50]}...")
+    logger.info(f"[文件提取] 开始下载并提取PDF文件: {media_url[:50]}...")
     
     try:
         import tempfile
@@ -203,30 +234,25 @@ async def download_and_extract_pdf(media_url: str) -> str:
                     all_content.append(page_text)
             
             extracted_text = "\n\n".join(all_content)
-            logger.info(f"PDF提取完成，页数: {len(reader.pages)}, 总字符数: {len(extracted_text)}")
+            logger.info(f"[文件提取] PDF提取完成，页数: {len(reader.pages)}, 总字符数: {len(extracted_text)}")
             
             return extracted_text[:3000]
         except ImportError:
-            logger.warning("PyPDF2库未安装，无法提取PDF内容")
+            logger.warning("[文件提取] PyPDF2库未安装，无法提取PDF内容")
             return ""
         except Exception as e:
-            logger.error(f"提取PDF内容失败: {str(e)}")
+            logger.error(f"[文件提取] 提取PDF内容失败: {str(e)}")
             return ""
         finally:
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
     except Exception as e:
-        logger.error(f"下载PDF文件失败: {str(e)}")
+        logger.error(f"[文件提取] 下载PDF文件失败: {str(e)}")
         return ""
 
 
 async def download_and_read_text(media_url: str) -> str:
-    """
-    下载并读取纯文本文件（TXT等）
-    :param media_url: 文件URL
-    :return: 读取的文本内容，失败返回空字符串
-    """
-    logger.info(f"开始下载并读取文本文件: {media_url[:50]}...")
+    logger.info(f"[文件提取] 开始下载并读取文本文件: {media_url[:50]}...")
     
     try:
         async with httpx.AsyncClient() as http_client:
@@ -234,34 +260,32 @@ async def download_and_read_text(media_url: str) -> str:
             response.raise_for_status()
             
             text = response.text
-            logger.info(f"文本文件读取完成，总字符数: {len(text)}")
+            logger.info(f"[文件提取] 文本文件读取完成，总字符数: {len(text)}")
             
             return text[:3000]
     except Exception as e:
-        logger.error(f"下载或读取文本文件失败: {str(e)}")
+        logger.error(f"[文件提取] 下载或读取文本文件失败: {str(e)}")
         return ""
 
 
 async def extract_media_text(media_url: str, media_type: str) -> str:
-    """
-    异步提取单张图片/单个文件的文本信息
-    - 图片：使用多模态模型进行图像描述
-    - DOCX文件：本地提取文本和表格（不提取图像）
-    - 其他文件：使用文本模型分析文件URL
-    :param media_url: 媒体文件URL
-    :param media_type: 媒体类型 IMAGE/FILE
-    :return: 提取的文本内容
-    """
-    logger.info(f"开始提取{media_type}文本: {media_url[:50]}...")
-    logger.info(f"media_type: {media_type}, media_url.endswith('.docx'): {media_url.lower().endswith('.docx')}")
+    start_time = time.time()
     
     if media_type == "IMAGE":
-        if not multimodal_client:
-            logger.error("多模态客户端未初始化，无法提取图片内容")
+        if ocr_client:
+            client = ocr_client
+            model = OCR_MODEL
+            logger.info(f"[图片提取] 使用OCR模型: {OCR_MODEL}")
+        elif multimodal_client:
+            client = multimodal_client
+            model = MULTIMODAL_MODEL
+            logger.info(f"[图片提取] 使用多模态模型: {MULTIMODAL_MODEL}")
+        else:
+            logger.error("[图片提取] OCR和多模态客户端均未初始化，无法提取图片内容")
             return ""
         
         system_prompt = """你是一个专业的图片内容分析助手。请全面分析图片中的信息。
-        
+
 要求：
 1. 如果图片包含文字，准确识别并提取所有文字内容
 2. 如果图片包含图像（照片、图表、图形等），详细描述图像内容
@@ -275,20 +299,18 @@ async def extract_media_text(media_url: str, media_type: str) -> str:
                 {"type": "text", "text": "请全面分析这张图片的内容，包括文字和图像描述"},
                 {"type": "image_url", "image_url": {"url": media_url}}
             ]
-            logger.info(f"图片格式: base64数据")
         elif media_url.startswith("http"):
             content = [
                 {"type": "text", "text": "请全面分析这张图片的内容，包括文字和图像描述"},
                 {"type": "image_url", "image_url": {"url": media_url}}
             ]
-            logger.info(f"图片格式: HTTP URL")
         else:
-            logger.error(f"不支持的图片URL格式: {media_url[:30]}...")
+            logger.error(f"[图片提取] 不支持的图片URL格式: {media_url[:30]}...")
             return ""
         
         try:
-            response = await multimodal_client.chat.completions.create(
-                model=MULTIMODAL_MODEL,
+            response = await client.chat.completions.create(
+                model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": content}
@@ -297,130 +319,190 @@ async def extract_media_text(media_url: str, media_type: str) -> str:
                 temperature=0.3
             )
             
+            duration = time.time() - start_time
+            
+            if response.usage:
+                logger.info(f"[图片提取] Token消耗(模型:{model}): prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, total={response.usage.total_tokens}, 耗时={duration:.2f}秒")
+            
             if response.choices and response.choices[0].message and response.choices[0].message.content:
                 extracted_text = response.choices[0].message.content.strip()
-                logger.info(f"图片提取成功(模型:{MULTIMODAL_MODEL})，长度: {len(extracted_text)}字符")
+                logger.info(f"[图片提取] 成功(模型:{model})，长度: {len(extracted_text)}字符，耗时={duration:.2f}秒")
                 return extracted_text
             else:
-                logger.warning("图片提取返回空内容")
+                logger.warning(f"[图片提取] 返回空内容，耗时={duration:.2f}秒")
                 return ""
         except Exception as e:
-            logger.error(f"图片提取失败(模型:{MULTIMODAL_MODEL}): {str(e)}")
+            duration = time.time() - start_time
+            logger.error(f"[图片提取] 失败(模型:{model}): {str(e)}，耗时={duration:.2f}秒")
             return ""
     else:
-        logger.info(f"进入文件提取分支，media_url.startswith('http'): {media_url.startswith('http')}")
         if not media_url.startswith("http"):
-            logger.error(f"不支持的文件URL格式: {media_url[:30]}...")
+            logger.error(f"[文件提取] 不支持的文件URL格式: {media_url[:30]}...")
             return ""
         
         url_lower = media_url.lower()
-        logger.info(f"文件URL小写: {url_lower}")
-        logger.info(f"url_lower.endswith('.docx'): {url_lower.endswith('.docx')}")
         
         if url_lower.endswith(".docx"):
-            result = await download_and_extract_docx(media_url)
-            logger.info(f"download_and_extract_docx返回结果长度: {len(result) if result else 0}")
-            return result
+            return await download_and_extract_docx(media_url)
         elif url_lower.endswith(".pdf"):
             return await download_and_extract_pdf(media_url)
-        elif url_lower.endswith(".txt"):
-            return await download_and_read_text(media_url)
-        elif url_lower.endswith(".md"):
-            return await download_and_read_text(media_url)
-        elif url_lower.endswith(".json"):
-            return await download_and_read_text(media_url)
-        elif url_lower.endswith(".csv"):
-            return await download_and_read_text(media_url)
-        elif url_lower.endswith(".xml"):
+        elif url_lower.endswith(".txt") or url_lower.endswith(".md") or url_lower.endswith(".json") or url_lower.endswith(".csv") or url_lower.endswith(".xml"):
             return await download_and_read_text(media_url)
         else:
-            logger.warning(f"不支持的文件类型，URL: {media_url[:50]}...")
+            logger.warning(f"[文件提取] 不支持的文件类型: {media_url[:50]}...")
             return ""
 
 
 async def extract_media_text_batch(media_urls: List[str], media_type: str) -> str:
-    """
-    异步提取多张图片/多个文件的文本信息
-    :param media_urls: 媒体文件URL列表
-    :param media_type: 媒体类型 IMAGE/FILE
-    :return: 提取的文本内容（合并后的）
-    """
-    logger.info(f"开始批量提取{media_type}文本: 数量={len(media_urls)}")
+    """批量提取媒体文本 - 使用并行处理提高速度"""
+    start_time = time.time()
+    logger.info(f"[批量提取] 开始提取{media_type}文本: 数量={len(media_urls)}")
+    
+    if media_type == "IMAGE" and len(media_urls) > 1:
+        # 图片类型：尝试一次调用处理多张图片（支持多图输入的模型）
+        extracted_text = await extract_multiple_images(media_urls)
+        if extracted_text:
+            duration = time.time() - start_time
+            logger.info(f"[批量提取] 批量处理完成，总字符数: {len(extracted_text)}, 耗时={duration:.2f}秒")
+            return extracted_text
+        else:
+            # 批量处理失败，回退到并行处理
+            logger.info(f"[批量提取] 批量处理失败，回退到并行处理")
+    
+    # 并行处理多个媒体文件
+    tasks = []
+    for i, url in enumerate(media_urls):
+        logger.info(f"[批量提取] 启动任务{i+1}/{len(media_urls)}: {url[:50]}...")
+        tasks.append(extract_media_text(url, media_type))
+    
+    # 使用asyncio.gather并发执行
+    results = await asyncio.gather(*tasks)
     
     all_extracted = []
-    for i, url in enumerate(media_urls):
-        logger.info(f"提取第{i+1}/{len(media_urls)}个{media_type}: {url[:50]}...")
-        text = await extract_media_text(url, media_type)
+    for i, text in enumerate(results):
         if text:
-            all_extracted.append(f"【文件{i+1}】\n{text}")
+            all_extracted.append(f"图{i+1}：{text}")
         else:
-            all_extracted.append(f"【文件{i+1}】\n[提取失败]")
+            all_extracted.append(f"图{i+1}：[提取失败]")
     
-    return "\n\n".join(all_extracted)
+    duration = time.time() - start_time
+    result = "\n\n".join(all_extracted)
+    logger.info(f"[批量提取] 并行处理完成，总字符数: {len(result)}, 耗时={duration:.2f}秒")
+    
+    return result
+
+
+async def extract_multiple_images(media_urls: List[str]) -> str:
+    """一次调用处理多张图片 - 支持多图输入的模型"""
+    start_time = time.time()
+    logger.info(f"[多图提取] 一次调用处理{len(media_urls)}张图片")
+    
+    if ocr_client:
+        client = ocr_client
+        model = OCR_MODEL
+        logger.info(f"[多图提取] 使用OCR模型: {OCR_MODEL}")
+    elif multimodal_client:
+        client = multimodal_client
+        model = MULTIMODAL_MODEL
+        logger.info(f"[多图提取] 使用多模态模型: {MULTIMODAL_MODEL}")
+    else:
+        logger.error("[多图提取] OCR和多模态客户端均未初始化")
+        return ""
+    
+    system_prompt = """你是一个专业的图片内容分析助手。请按图片顺序编号分析所有图片。
+
+输出格式要求：
+- 每张图片的分析必须以"图N："开头（N为图片序号，从1开始）
+- 图1：描述第一张图片的内容
+- 图2：描述第二张图片的内容
+- 以此类推
+
+分析要求：
+1. 如果图片包含文字，准确识别并提取所有文字内容
+2. 如果图片包含图像（照片、图表、图形等），详细描述图像内容
+3. 保持文字的原有顺序和排版结构
+4. 对于无法识别的部分，用[无法识别]标注
+5. 长度控制在1500字以内"""
+    
+    # 构建多图内容
+    content = [{"type": "text", "text": "请全面分析以下所有图片的内容，包括文字和图像描述"}]
+    for i, url in enumerate(media_urls):
+        content.append({"type": "image_url", "image_url": {"url": url, "index": i + 1}})
+    
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content}
+            ],
+            stream=False,
+            temperature=0.3
+        )
+        
+        duration = time.time() - start_time
+        
+        if response.usage:
+            logger.info(f"[多图提取] Token消耗(模型:{model}): prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, total={response.usage.total_tokens}, 耗时={duration:.2f}秒")
+        
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            extracted_text = response.choices[0].message.content.strip()
+            logger.info(f"[多图提取] 成功(模型:{model})，长度: {len(extracted_text)}字符，耗时={duration:.2f}秒")
+            return extracted_text
+        else:
+            logger.warning(f"[多图提取] 返回空内容，耗时={duration:.2f}秒")
+            return ""
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(f"[多图提取] 失败(模型:{model}): {str(e)}，耗时={duration:.2f}秒")
+        return ""
 
 
 async def stream_model_response(message: str, history: Optional[List[dict]] = None,
                                 user_id: Optional[int] = None, session_id: Optional[int] = None,
                                 message_type: str = "TEXT", media_url: Optional[str] = None,
                                 media_urls: Optional[List[str]] = None,
-                                message_uuid: Optional[str] = None):
-    """
-    流式生成模型响应（支持多模态）
-    多模态消息流程：先同步提取文本 → 当前轮发送地址+用户提问给多模态模型 → 提取的文本存入redis和mysql → 后续轮次使用提取的文本作为历史
-    :param message: 用户消息
-    :param history: 历史对话记录
-    :param user_id: 用户ID
-    :param session_id: 会话ID
-    :param message_type: 消息类型 TEXT/IMAGE/FILE/VOICE
-    :param media_url: 媒体文件URL
-    :return: 流式响应生成器
-    """
-    logger.info(f"处理消息: type={message_type}, '{message[:100]}...', 历史消息数={len(history) if history else 0}, user_id={user_id}, session_id={session_id}")
+                                message_uuid: Optional[str] = None,
+                                mode: str = "fast"):
+    request_start_time = time.time()
+    logger.info(f"{'='*60}")
+    logger.info(f"[请求开始] 会话ID: {session_id}, 用户ID: {user_id}, 消息类型: {message_type}")
+    logger.info(f"[请求开始] 用户消息: '{message[:100]}...'")
+    logger.info(f"[请求开始] 历史消息数: {len(history) if history else 0}")
+    logger.info(f"[请求开始] 模式: {mode}")
+    logger.info(f"{'='*60}")
+    
+    # 根据模式选择处理函数
+    if mode == "expert":
+        async for result in expert_mode_process(message, history, user_id, session_id, 
+                                                message_type, media_url, media_urls, 
+                                                message_uuid, request_start_time):
+            yield result
+        return
 
     extracted_text = ""
     is_multimodal = message_type in ("IMAGE", "FILE")
     
-    logger.info(f"=== 提取条件检查 ===")
-    logger.info(f"message_type: '{message_type}'")
-    logger.info(f"is_multimodal: {is_multimodal}")
-    logger.info(f"media_url: '{media_url[:50]}...'" if media_url else "media_url: None")
-    logger.info(f"media_urls数量: {len(media_urls) if media_urls else 0}")
-    logger.info(f"提取条件: is_multimodal={is_multimodal}, media_url存在={media_url is not None}, media_urls存在={media_urls is not None and len(media_urls) > 0}")
-    
     if is_multimodal and (media_url or (media_urls and len(media_urls) > 0)):
         if media_urls and len(media_urls) > 0:
-            logger.info(f"开始批量提取{message_type}文本: 数量={len(media_urls)}")
             extracted_text = await extract_media_text_batch(media_urls, message_type)
-            logger.info(f"=== 批量提取结果确认 ===")
-            logger.info(f"extract_media_text_batch返回值长度: {len(extracted_text) if extracted_text else 0}")
-            if extracted_text:
-                logger.info(f"{message_type}批量文本提取成功，长度: {len(extracted_text)}字符")
-            else:
-                logger.warning(f"{message_type}批量文本提取失败，将使用原始消息进行记忆检索")
         else:
-            logger.info(f"开始同步提取{message_type}文本: {media_url[:50]}...")
             extracted_text = await extract_media_text(media_url, message_type)
-            logger.info(f"=== 提取结果确认 ===")
-            logger.info(f"extract_media_text返回值类型: {type(extracted_text)}")
-            logger.info(f"extract_media_text返回值: '{extracted_text[:100]}...'" if extracted_text else "extract_media_text返回值: None")
-            logger.info(f"extract_media_text返回值长度: {len(extracted_text) if extracted_text else 0}")
-            if extracted_text:
-                logger.info(f"{message_type}文本提取成功，长度: {len(extracted_text)}字符")
-            else:
-                logger.warning(f"{message_type}文本提取失败，将使用原始消息进行记忆检索")
+        
+        if extracted_text:
+            logger.info(f"[媒体提取] 成功，长度: {len(extracted_text)}字符")
+        else:
+            logger.warning(f"[媒体提取] 失败，将使用原始消息进行记忆检索")
 
     memories = []
     if session_id:
+        mem_start = time.time()
         try:
-            if extracted_text:
-                search_query = f"{message} {extracted_text}"
-            else:
-                search_query = message if message_type in ("TEXT", "VOICE") else (f"{message} {media_url}" if media_url else message)
+            search_query = f"{message} {extracted_text}" if extracted_text else (message if message_type in ("TEXT", "VOICE") else (f"{message} {media_url}" if media_url else message))
             memories = await memory_service.search_memories(search_query, session_id, top_k=5)
+            logger.info(f"[记忆检索] 完成，找到{len(memories)}条相关记忆，耗时={time.time()-mem_start:.2f}秒")
         except Exception as e:
-            logger.error(f"记忆检索失败: {e}")
-    
-    logger.info(f"检索到 {len(memories)} 条相关记忆")
+            logger.error(f"[记忆检索] 失败: {e}")
 
     search_results = []
     search_context = ""
@@ -432,16 +514,21 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         memories_text = "\n".join([f"- {m['content']}" for m in memories])
         context_text += f"\n\n相关记忆：\n{memories_text}"
 
+    orch_start = time.time()
     orchestration_result = await _call_orchestration_model(context_text, message)
+    logger.info(f"[编排器] 调用完成，耗时={time.time()-orch_start:.2f}秒")
+    
     if orchestration_result:
         need_search = orchestration_result.get("need_search", False)
         search_keywords = orchestration_result.get("search_keywords", [])
         
-        logger.info(f"编排器结果: need_search={need_search}, keywords={search_keywords}")
+        logger.info(f"[编排器结果] need_search={need_search}, keywords={search_keywords}")
         
         if need_search and search_keywords:
+            search_start = time.time()
             search_results = await search_service.web_search(search_keywords)
             search_context = await search_service.get_search_context(search_keywords)
+            logger.info(f"[联网搜索] 完成，找到{len(search_results)}条结果，耗时={time.time()-search_start:.2f}秒")
 
     system_prompt = """你是爱尔奎特·布伦史塔德，高贵的真祖，月之公主，吸血鬼中的最高存在。
 
@@ -484,7 +571,6 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
                     else:
                         content = f"[用户上传了文件]\n提问：{content}"
                 messages.append({"role": role, "content": content})
-                logger.debug(f"添加历史消息: {role} - {msg_type} - {content[:50]}...")
 
     is_multimodal = message_type == "IMAGE"
     
@@ -492,7 +578,6 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         user_content = [{"type": "text", "text": message}]
         for url in media_urls:
             user_content.append({"type": "image_url", "image_url": {"url": url}})
-        logger.info(f"多图片消息内容构建完成，图片数量: {len(media_urls)}")
     elif is_multimodal and media_url:
         user_content = [
             {"type": "text", "text": message},
@@ -504,22 +589,11 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
             user_content = f"[用户上传了{len(media_urls)}个文件]\n用户提问: {message}{file_text}"
         else:
             user_content = f"[用户上传了文件]\n文件地址: {media_url}\n用户提问: {message}{file_text}"
-        logger.info(f"文件消息内容构建完成，提取文本长度: {len(extracted_text) if extracted_text else 0}, 总内容长度: {len(user_content)}")
-        logger.debug(f"文件消息内容:\n{user_content[:500]}...")
     else:
         user_content = message
     
     messages.append({"role": "user", "content": user_content})
-    logger.info(f"发送给模型的消息总数: {len(messages)}, 多模态={is_multimodal}, 消息类型={message_type}, 用户内容长度: {len(str(user_content))}")
-    
-    if message_type == "FILE":
-        logger.info("=== FILE消息强制确认 ===")
-        logger.info(f"extracted_text是否存在: {extracted_text is not None}")
-        logger.info(f"extracted_text长度: {len(extracted_text) if extracted_text else 0}")
-        logger.info(f"media_url是否存在: {media_url is not None}")
-        logger.info(f"message_uuid是否存在: {message_uuid is not None}")
-        logger.info(f"user_content中是否包含'文件内容': {'文件内容' in user_content}")
-        logger.info(f"user_content完整内容:\n{user_content[:500]}")
+    logger.info(f"[消息构建] 发送给模型的消息数: {len(messages)}, 用户内容长度: {len(str(user_content))}")
 
     assistant_response = ""
     if is_multimodal:
@@ -533,15 +607,14 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         current_client = client
 
     try:
-        import time
-        start_time = time.time()
+        model_start = time.time()
         
         response = await current_client.chat.completions.create(
             model=current_model,
             messages=messages,
             stream=True
         )
-        logger.info(f"成功连接到模型API({current_model}), 开始流式传输")
+        logger.info(f"[模型调用] 成功连接到模型API({current_model}), 开始流式传输")
 
         chunk_count = 0
         total_content = ""
@@ -552,104 +625,126 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
                     chunk_count += 1
                     total_content += content
                     assistant_response += content
-                    logger.debug(f"分片 {chunk_count}: '{content}'")
-                    import json
+                    logger.debug(f"[流式传输] 分片 {chunk_count}: '{content}'")
                     yield json.dumps({"type": "content", "data": content}, ensure_ascii=False) + "\n"
 
-        end_time = time.time()
-        duration = end_time - start_time
-        logger.info(f"流传输完成, 总分片数={chunk_count}, 内容长度={len(total_content)}字符, 耗时={duration:.2f}秒")
+        model_duration = time.time() - model_start
+        
+        if hasattr(response, 'usage') and response.usage:
+            logger.info(f"[模型调用] Token消耗(模型:{current_model}): prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, total={response.usage.total_tokens}, 耗时={model_duration:.2f}秒")
+        
+        logger.info(f"[流式传输] 完成, 总分片数={chunk_count}, 内容长度={len(total_content)}字符, 耗时={model_duration:.2f}秒")
 
         if chunk_count == 0:
-            logger.warning("未收到模型返回的内容")
+            logger.warning("[流式传输] 未收到模型返回的内容")
 
         if search_results:
-            import json
-            yield json.dumps({"type": "search_results", "data": search_results}, ensure_ascii=False) + "\n"
-            logger.info(f"已通过流式响应返回搜索结果: {len(search_results)}条")
+            # 过滤搜索结果，只保留标题和URL，不保存搜索摘要（content）
+            filtered_results = []
+            for result in search_results:
+                filtered_results.append({
+                    "title": result.get("title", ""),
+                    "url": result.get("url", "")
+                })
+            yield json.dumps({"type": "search_results", "data": filtered_results}, ensure_ascii=False) + "\n"
+            logger.info(f"[搜索结果] 已通过流式响应返回: {len(filtered_results)}条")
 
     except Exception as e:
-        logger.error(f"调用模型API出错: {str(e)}")
+        logger.error(f"[模型调用] 出错: {str(e)}")
         yield f"错误: {str(e)}"
 
-    logger.info(f"=== 回写条件检查 ===")
-    logger.info(f"user_id是否存在: {user_id is not None}")
-    logger.info(f"assistant_response长度: {len(assistant_response)}")
-    logger.info(f"extracted_text长度: {len(extracted_text) if extracted_text else 0}")
-    logger.info(f"media_url是否存在: {media_url is not None}")
-    
     if user_id and assistant_response:
-        logger.info("满足回写条件，开始处理...")
         if extracted_text and media_url:
-            if message_type == "IMAGE":
-                combined_content = f"[用户提问]{message}\n[图片内容]{extracted_text}"
-            elif message_type == "FILE":
-                combined_content = f"[用户提问]{message}\n[文件内容]{extracted_text}"
-            else:
-                combined_content = message
+            combined_content = f"[用户提问]{message}\n[图片内容]{extracted_text}" if message_type == "IMAGE" else f"[用户提问]{message}\n[文件内容]{extracted_text}"
             
             asyncio.create_task(
                 memory_service.async_extract_and_store(
                     combined_content, assistant_response, user_id, session_id
                 )
             )
-            logger.info(f"{message_type}消息记忆入库完成（提取文本长度: {len(extracted_text)}）")
             
-            logger.info(f"准备回写消息内容: message_uuid={message_uuid}, extracted_text_length={len(extracted_text)}")
             if message_uuid:
-                logger.info("开始执行消息内容回写...")
                 await update_backend_message_content(session_id, message_uuid, message, extracted_text)
-                logger.info("消息内容回写完成！")
-            else:
-                logger.warning("消息内容回写跳过：message_uuid为空")
-            
-            if search_results:
-                logger.info(f"搜索结果已通过流式响应返回，无需单独保存: {len(search_results)}条")
         else:
             asyncio.create_task(
                 memory_service.async_extract_and_store(
                     message, assistant_response, user_id, session_id
                 )
             )
-            logger.info("已调度异步记忆提取和存储")
-            
-            if search_results:
-                logger.info(f"搜索结果已通过流式响应返回，无需单独保存: {len(search_results)}条")
+
+    total_duration = time.time() - request_start_time
+    logger.info(f"{'='*60}")
+    logger.info(f"[请求结束] 总耗时={total_duration:.2f}秒")
+    logger.info(f"[请求结束] 助手响应长度: {len(assistant_response)}字符")
+    logger.info(f"[请求结束] 搜索结果数: {len(search_results)}")
+    logger.info(f"[请求结束] 记忆条数: {len(memories)}")
+    logger.info(f"{'='*60}")
 
 
 async def _call_orchestration_model(context_text: str, message: str) -> dict:
-    """
-    调用编排器小模型，判断是否需要联网搜索，并生成搜索关键词
-    :param context_text: 上下文文本（包含用户提问、提取的媒体文本、相关记忆）
-    :param message: 用户原始提问
-    :return: 编排结果字典，包含need_search和search_keywords
-    """
     if not orchestration_client:
-        logger.warning("编排器client未初始化，跳过编排")
+        logger.warning("[编排器] client未初始化，跳过编排")
         return {"need_search": False, "search_keywords": [], "analysis_text": "编排器未初始化"}
     
-    import time
     start_time = time.time()
-    logger.info(f"开始调用编排器小模型({ORCHESTRATION_MODEL})，上下文长度: {len(context_text)}")
     
     system_prompt = """你是一个智能编排器，负责分析用户问题和上下文，决定是否需要联网搜索。
 
-【输出格式】
-必须输出严格的JSON格式，包含以下字段：
-- need_search: 布尔值，是否需要联网搜索
-- search_keywords: 字符串数组，搜索关键词列表（最多5个）
-- analysis_text: 对问题的简要分析（用于调试）
+【核心职责】
+判断用户问题是否需要通过联网搜索获取最新信息，以提升回答的准确性和时效性。
 
-【判断规则】
-- 需要最新信息（新闻、事件、数据、当前状态）→ need_search: true
-- 需要专业知识但不确定准确性 → 需要搜索验证
-- 关于人物、地点、事件的最新信息 → 需要搜索
-- 纯聊天、情感交流、已有记忆足够回答 → need_search: false
-- 已有记忆中的信息可以直接回答 → need_search: false
+【输出格式】
+必须输出严格的JSON格式，不要包含任何markdown代码块标记，不要包含解释文字。
+格式示例：{"need_search": true, "search_keywords": ["关键词1", "关键词2"], "analysis_text": "分析原因"}
+
+字段说明：
+- need_search: 布尔值，true表示需要搜索，false表示不需要搜索
+- search_keywords: 字符串数组，搜索关键词列表（1-5个，简洁准确）
+- analysis_text: 对判断的简要分析（用于调试，50字以内）
+
+【必须搜索的场景（need_search = true）】
+1. 当前时间相关：今天天气、今天新闻、最近事件、最新数据
+2. 时效性强：股价、赛事结果、体育比分、实时状态
+3. 最新信息：新发布、新版本、最新进展、今日资讯
+4. 特定日期：2026年7月、本周、本月、近期
+5. 地点相关：xxx天气、xxx新闻、xxx现状
+6. 不确定的事实：是否、有没有、是否存在、最新消息
+
+【不需要搜索的场景（need_search = false）】
+1. 常识性问题：地球是圆的、1+1=2、太阳从东方升起
+2. 纯聊天对话：你好、早上好、谢谢、闲聊
+3. 情感交流：安慰、鼓励、建议
+4. 已有记忆足够回答：用户之前提到过的信息
+5. 历史事实：已经发生过的、有定论的历史事件
+6. 数学计算：简单的加减乘除、逻辑推理
+
+【关键词提取规则】
+1. 关键词要简洁，每个词2-8个字
+2. 优先使用中文关键词
+3. 避免使用过于宽泛的词（如"新闻"、"信息"）
+4. 包含核心实体（人物、地点、事件、时间）
 
 【示例】
-{"need_search": true, "search_keywords": ["2024年人工智能发展", "AI最新技术"], "analysis_text": "用户询问最新AI发展情况，需要获取最新信息"}
-{"need_search": false, "search_keywords": [], "analysis_text": "用户询问已有记忆中的内容，无需搜索"}"""
+用户提问："今天北京天气怎么样？"
+输出：{"need_search": true, "search_keywords": ["2026年7月23日北京天气预报"], "analysis_text": "查询当前天气需要最新数据"}
+
+用户提问："你是谁？"
+输出：{"need_search": false, "search_keywords": [], "analysis_text": "自我介绍不需要搜索"}
+
+用户提问："Python和Java哪个好？"
+输出：{"need_search": false, "search_keywords": [], "analysis_text": "技术选型建议不需要最新数据"}
+
+用户提问："2026年奥运会在哪里举办？"
+输出：{"need_search": true, "search_keywords": ["2026年奥运会举办地点"], "analysis_text": "需要确认最新赛事信息"}
+
+用户提问："昨天买的贵州茅台股票今天涨了吗？"
+输出：{"need_search": true, "search_keywords": ["贵州茅台今日股价"], "analysis_text": "需要查询实时股价"}
+
+用户提问："iPhone 17什么时候发布？"
+输出：{"need_search": true, "search_keywords": ["iPhone 17发布时间"], "analysis_text": "需要查询最新产品发布信息"}
+
+用户提问："杭州亚运会中国获得多少金牌？"
+输出：{"need_search": true, "search_keywords": ["杭州亚运会中国金牌数"], "analysis_text": "需要查询赛事结果"}"""
 
     user_prompt = f"""用户提问：{message}
 
@@ -671,15 +766,13 @@ async def _call_orchestration_model(context_text: str, message: str) -> dict:
                 temperature=0.3
             )
 
-            end_time = time.time()
-            duration = end_time - start_time
+            if response.usage:
+                logger.info(f"[编排器] Token消耗(模型:{ORCHESTRATION_MODEL}): prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, total={response.usage.total_tokens}")
 
             if response.choices and response.choices[0].message and response.choices[0].message.content:
                 content = response.choices[0].message.content.strip()
-                logger.debug(f"编排器响应(第{attempt}次): {content}")
                 
                 content = _clean_json_response(content)
-                logger.debug(f"清理后内容: {content}")
                 
                 try:
                     result = json.loads(content)
@@ -687,16 +780,14 @@ async def _call_orchestration_model(context_text: str, message: str) -> dict:
                         need_search = result.get("need_search", False)
                         search_keywords = result.get("search_keywords", [])
                         analysis_text = result.get("analysis_text", "")
-                        logger.info(f"编排器运行完成({ORCHESTRATION_MODEL})，耗时={duration:.2f}秒, need_search={need_search}, keywords={search_keywords}")
                         return {
                             "need_search": need_search,
                             "search_keywords": search_keywords,
                             "analysis_text": analysis_text
                         }
                 except json.JSONDecodeError as je:
-                    logger.warning(f"第{attempt}次调用JSON解析失败: {je}, 内容='{content[:200]}'")
+                    logger.warning(f"[编排器] 第{attempt}次调用JSON解析失败: {je}")
                     if attempt < max_retries:
-                        logger.info(f"准备重试编排器调用...")
                         user_prompt = f"""用户提问：{message}
 
 上下文信息：
@@ -706,36 +797,24 @@ async def _call_orchestration_model(context_text: str, message: str) -> dict:
 
 【强制要求】
 必须输出严格的JSON格式，不要包含任何markdown代码块标记（如```json），不要包含任何解释文字。
-只输出JSON对象：{"need_search": true/false, "search_keywords": [...], "analysis_text": "..."}"""
+只输出JSON对象：{{"need_search": true/false, "search_keywords": [...], "analysis_text": "..."}}"""
                     continue
         except Exception as e:
-            end_time = time.time()
-            duration = end_time - start_time
-            logger.error(f"第{attempt}次调用编排器小模型失败({ORCHESTRATION_MODEL})，耗时={duration:.2f}秒: {e}")
+            logger.error(f"[编排器] 第{attempt}次调用失败({ORCHESTRATION_MODEL}): {e}")
             if attempt < max_retries:
-                logger.info(f"准备重试编排器调用...")
                 continue
 
-    end_time = time.time()
-    duration = end_time - start_time
-    logger.error(f"调用编排器小模型失败({ORCHESTRATION_MODEL})，已重试{max_retries}次，总耗时={duration:.2f}秒")
+    logger.error(f"[编排器] 调用失败({ORCHESTRATION_MODEL})，已重试{max_retries}次")
     return {"need_search": False, "search_keywords": [], "analysis_text": "编排器调用失败"}
 
 
 def _clean_json_response(content: str) -> str:
-    """
-    清理模型返回的JSON响应，去除markdown代码块标记和多余内容
-    :param content: 原始响应内容
-    :return: 清理后的JSON字符串
-    """
     if not content:
         return content
     
     content = content.strip()
     
-    # 去除markdown代码块标记
     if content.startswith("```"):
-        # 找到第一个和最后一个```之间的内容
         first_backtick = content.find("```")
         last_backtick = content.rfind("```")
         if first_backtick != last_backtick:
@@ -743,34 +822,24 @@ def _clean_json_response(content: str) -> str:
         else:
             content = content[3:]
     
-    # 如果开头有json标记，去掉
     content = content.strip()
     if content.startswith("json"):
         content = content[4:].strip()
     
-    # 使用正则提取最外层的{}包裹的JSON对象
     import re
     json_match = re.search(r'\{[\s\S]*\}', content)
     if json_match:
         content = json_match.group(0)
     
-    # 去除首尾空白字符和换行
     return content.strip()
 
 
 async def update_backend_search_results(session_id: int, message_uuid: str, search_results: list):
-    """
-    调用后端接口更新消息搜索结果
-    :param session_id: 会话ID
-    :param message_uuid: 消息唯一标识
-    :param search_results: 搜索结果列表（包含title和url）
-    """
     backend_url = os.getenv("BACKEND_URL", "http://localhost:8080")
     internal_secret = os.getenv("INTERNAL_SECRET", "")
     update_url = f"{backend_url}/api/message/update-search-results"
     
     try:
-        import json
         search_results_json = json.dumps(search_results, ensure_ascii=False)
         
         async with httpx.AsyncClient() as http_client:
@@ -788,21 +857,14 @@ async def update_backend_search_results(session_id: int, message_uuid: str, sear
             )
             
             if response.status_code == 200:
-                logger.info(f"搜索结果保存成功: session_id={session_id}, message_uuid={message_uuid}, count={len(search_results)}")
+                logger.info(f"[搜索结果保存] 成功: session_id={session_id}, message_uuid={message_uuid}, count={len(search_results)}")
             else:
-                logger.error(f"搜索结果保存失败: status={response.status_code}, {response.text}")
+                logger.error(f"[搜索结果保存] 失败: status={response.status_code}, {response.text}")
     except Exception as e:
-        logger.error(f"调用后端更新搜索结果失败: {str(e)}")
+        logger.error(f"[搜索结果保存] 调用后端失败: {str(e)}")
 
 
 async def update_backend_message_content(session_id: int, message_uuid: str, message: str, extracted_text: str):
-    """
-    调用后端接口更新消息内容（用于多模态消息异步提取文本后回写）
-    :param session_id: 会话ID
-    :param message_uuid: 消息唯一标识
-    :param message: 用户原始提问
-    :param extracted_text: 提取后的文本内容
-    """
     backend_url = os.getenv("BACKEND_URL", "http://localhost:8080")
     internal_secret = os.getenv("INTERNAL_SECRET", "")
     update_url = f"{backend_url}/api/message/update-content"
@@ -824,11 +886,11 @@ async def update_backend_message_content(session_id: int, message_uuid: str, mes
             )
             
             if response.status_code == 200:
-                logger.info(f"消息内容回写成功: session_id={session_id}, message_uuid={message_uuid}")
+                logger.info(f"[消息回写] 成功: session_id={session_id}, message_uuid={message_uuid}")
             else:
-                logger.error(f"消息内容回写失败: status={response.status_code}, {response.text}")
+                logger.error(f"[消息回写] 失败: status={response.status_code}, {response.text}")
     except Exception as e:
-        logger.error(f"调用后端更新消息内容失败: {str(e)}")
+        logger.error(f"[消息回写] 调用后端失败: {str(e)}")
 
 
 @app.get("/health")
@@ -838,16 +900,9 @@ async def health():
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    """
-    处理聊天请求（支持多模态）
-    :param request: ChatRequest对象，包含message, history, user_id, session_id, message_type, media_url, message_uuid
-    :return: StreamingResponse流式响应
-    """
-    logger.info(f"收到聊天请求: type={request.message_type}, message='{request.message[:100]}...', "
+    logger.info(f"[API入口] 收到聊天请求: type={request.message_type}, message='{request.message[:100]}...', "
                 f"history={len(request.history) if request.history else 0}条, "
-                f"user_id={request.user_id}, session_id={request.session_id}, "
-                f"media_url={request.media_url[:30]}..." if request.media_url else "media_url=None"
-                f", media_urls数量={len(request.media_urls) if request.media_urls else 0}")
+                f"user_id={request.user_id}, session_id={request.session_id}, mode={request.mode}")
     return StreamingResponse(
         stream_model_response(
             request.message, 
@@ -857,20 +912,518 @@ async def chat(request: ChatRequest):
             request.message_type or "TEXT",
             request.media_url,
             request.media_urls,
-            request.message_uuid
+            request.message_uuid,
+            request.mode or "fast"
         ),
-        media_type="text/event-stream"
+        media_type="text/event-stream; charset=utf-8"
     )
 
 
+# === 专家模式处理函数 ===
+async def expert_mode_process(message: str, history: Optional[List[dict]], user_id: Optional[int], 
+                              session_id: Optional[int], message_type: str, media_url: Optional[str],
+                              media_urls: Optional[List[str]], message_uuid: Optional[str],
+                              request_start_time: float):
+    """专家模式处理流程：编排器 + Tool调用循环 + 深度思考模型"""
+    
+    logger.info(f"[专家模式] 开始处理")
+    
+    # 1. 媒体提取（图片/文件）
+    extracted_text = ""
+    all_media_urls = media_urls or []
+    if media_url and media_url not in all_media_urls:
+        all_media_urls.append(media_url)
+    
+    is_multimodal = message_type in ("IMAGE", "FILE")
+    if is_multimodal and len(all_media_urls) > 0:
+        if len(all_media_urls) > 1:
+            extracted_text = await extract_media_text_batch(all_media_urls, message_type)
+        else:
+            extracted_text = await extract_media_text(all_media_urls[0], message_type)
+        
+        if extracted_text:
+            logger.info(f"[专家模式][媒体提取] 成功，长度: {len(extracted_text)}字符")
+        else:
+            logger.warning(f"[专家模式][媒体提取] 失败")
+    
+    # 2. 记忆检索
+    memories = []
+    if session_id:
+        mem_start = time.time()
+        try:
+            search_query = f"{message} {extracted_text}" if extracted_text else message
+            memories = await memory_service.search_memories(search_query, session_id, top_k=5)
+            logger.info(f"[专家模式][记忆检索] 完成，找到{len(memories)}条相关记忆，耗时={time.time()-mem_start:.2f}秒")
+        except Exception as e:
+            logger.error(f"[专家模式][记忆检索] 失败: {e}")
+    
+    # 3. 构建上下文
+    context_text = message
+    if extracted_text:
+        context_text += f"\n\n[图片/文件提取内容]\n{extracted_text}"
+    if memories:
+        memories_text = "\n".join([f"- {m['content']}" for m in memories])
+        context_text += f"\n\n[相关记忆]\n{memories_text}"
+    
+    # 4. Tool调用循环
+    tool_results = []
+    search_results = []
+    
+    for iteration in range(EXPERT_MAX_ITERATIONS):
+        logger.info(f"[专家模式][迭代 {iteration+1}/{EXPERT_MAX_ITERATIONS}]")
+        
+        # 调用专家编排器（传递迭代信息和对话历史）
+        orch_start = time.time()
+        is_last_iteration = (iteration == EXPERT_MAX_ITERATIONS - 1)
+        orchestration_result = await _call_expert_orchestration_model(
+            context_text, message, extracted_text, tool_results, len(all_media_urls) > 0,
+            is_last_iteration, iteration + 1, EXPERT_MAX_ITERATIONS, history
+        )
+        logger.info(f"[专家模式][编排器] 调用完成，耗时={time.time()-orch_start:.2f}秒")
+        
+        if not orchestration_result:
+            break
+        
+        need_search = orchestration_result.get("need_search", False)
+        need_deep_thinking = orchestration_result.get("need_deep_thinking", False)
+        need_more_info = orchestration_result.get("need_more_info", False)
+        search_keywords = orchestration_result.get("search_keywords", [])
+        analysis_text = orchestration_result.get("analysis_text", "")
+        
+        # 关键修复：如果需要调用工具，强制继续迭代，确保工具结果被编排器看到后再生成回复
+        if need_search or need_deep_thinking:
+            need_more_info = True
+            logger.info(f"[专家模式][强制迭代] 需要调用工具，强制need_more_info=True")
+        
+        # 最后一次迭代强制生成回复
+        if iteration == EXPERT_MAX_ITERATIONS - 1:
+            need_more_info = False
+            logger.info(f"[专家模式][最后迭代] 强制生成最终回复")
+        
+        logger.info(f"[专家模式][编排器结果] need_search={need_search}, need_deep_thinking={need_deep_thinking}, "
+                    f"need_more_info={need_more_info}, keywords={search_keywords}, analysis_text='{analysis_text}'")
+        
+        # 调用联网搜索
+        if need_search and search_keywords:
+            # 发送搜索开始状态
+            yield json.dumps({"type": "search_start", "data": {"keywords": search_keywords}}, ensure_ascii=False) + "\n"
+            logger.info(f"[专家模式][联网搜索] 开始搜索: {search_keywords}")
+            
+            search_start = time.time()
+            current_search_results = await search_service.web_search(search_keywords)
+            search_context = await search_service.get_search_context(search_keywords)
+            search_duration = time.time() - search_start
+            logger.info(f"[专家模式][联网搜索] 完成，找到{len(current_search_results)}条结果，耗时={search_duration:.2f}秒")
+            
+            # 发送搜索摘要（包含搜索结果）
+            # 过滤搜索结果，只保留标题和URL，不保存搜索摘要（content）
+            filtered_results = []
+            for result in current_search_results:
+                filtered_results.append({
+                    "title": result.get("title", ""),
+                    "url": result.get("url", "")
+                })
+            
+            search_summary = {
+                "keywords": search_keywords,
+                "results": filtered_results,
+                "count": len(filtered_results),
+                "duration": round(search_duration, 2)
+            }
+            yield json.dumps({"type": "search_summary", "data": search_summary}, ensure_ascii=False) + "\n"
+            
+            search_results.extend(filtered_results)
+            tool_results.append({
+                "type": "search",
+                "keywords": search_keywords,
+                "results": current_search_results,
+                "context": search_context
+            })
+        
+        # 调用深度思考模型（不依赖图片，支持文本问题的深度分析）
+        if need_deep_thinking:
+            thinking_start = time.time()
+            # 深度思考模型返回生成器，收集思考内容并转发流式消息
+            deep_result = ""
+            async for chunk in _call_deep_thinking_model(message, all_media_urls, context_text, tool_results):
+                # 转发流式消息（思考过程）
+                yield chunk
+                # 同时收集最终结果（从特殊标记中提取）
+                if chunk.strip().startswith('{"type": "thinking"'):
+                    try:
+                        parsed = json.loads(chunk)
+                        deep_result += parsed.get("data", "")
+                    except:
+                        pass
+            
+            logger.info(f"[专家模式][深度思考] 完成，耗时={time.time()-thinking_start:.2f}秒")
+            
+            tool_results.append({
+                "type": "deep_thinking",
+                "result": deep_result
+            })
+        
+        # 判断是否需要继续迭代
+        if not need_more_info:
+            logger.info(f"[专家模式][迭代结束] 信息足够，停止迭代")
+            break
+    
+    # 5. 构建最终响应 - 使用流式调用来生成回复内容
+    logger.info(f"[专家模式][流式回复] 开始流式生成回复内容")
+    
+    assistant_response = ""
+    async for chunk in _stream_expert_reply(message, context_text, extracted_text, 
+                                            tool_results, search_results, history):
+        yield chunk
+        # 收集完整回复内容用于记忆持久化
+        if chunk.strip().startswith('{"type": "content"'):
+            try:
+                parsed = json.loads(chunk)
+                assistant_response += parsed.get("data", "")
+            except:
+                pass
+    
+    logger.info(f"[专家模式][流式回复] 完成")
+    
+    if search_results:
+        yield json.dumps({"type": "search_results", "data": search_results}, ensure_ascii=False) + "\n"
+        logger.info(f"[专家模式][搜索结果] 已通过流式响应返回: {len(search_results)}条")
+    
+    # 异步保存记忆（包含图片提取内容和完整回复）
+    if user_id and assistant_response:
+        if extracted_text:
+            # 如果有图片/文件提取内容，组合用户消息和提取内容
+            combined_content = f"[用户提问]{message}\n[图片内容]{extracted_text}" if message_type == "IMAGE" else f"[用户提问]{message}\n[文件内容]{extracted_text}"
+            
+            asyncio.create_task(
+                memory_service.async_extract_and_store(
+                    combined_content, assistant_response, user_id, session_id
+                )
+            )
+            logger.info(f"[专家模式][记忆持久化] 已启动异步任务，包含图片提取内容，用户消息长度={len(message)}, 提取内容长度={len(extracted_text)}, 回复长度={len(assistant_response)}")
+            
+            # 回写图片提取内容到后端MySQL
+            if message_uuid:
+                await update_backend_message_content(session_id, message_uuid, message, extracted_text)
+        else:
+            asyncio.create_task(
+                memory_service.async_extract_and_store(
+                    message, assistant_response, user_id, session_id
+                )
+            )
+            logger.info(f"[专家模式][记忆持久化] 已启动异步任务，无图片提取内容，用户消息长度={len(message)}, 回复长度={len(assistant_response)}")
+    
+    total_duration = time.time() - request_start_time
+    logger.info(f"{'='*60}")
+    logger.info(f"[专家模式][请求结束] 总耗时={total_duration:.2f}秒（流式回复）")
+    logger.info(f"[专家模式][请求结束] 搜索结果数: {len(search_results)}")
+    logger.info(f"[专家模式][请求结束] 记忆条数: {len(memories)}")
+    logger.info(f"[专家模式][请求结束] Tool调用次数: {len(tool_results)}")
+    logger.info(f"{'='*60}")
+    return
+
+
+async def _call_expert_orchestration_model(context_text: str, message: str, extracted_text: str, 
+                                           tool_results: list, has_images: bool,
+                                           is_last_iteration: bool = False, iteration: int = 1, 
+                                           max_iterations: int = 3, history: Optional[List[dict]] = None) -> dict:
+    """专家模式编排器：决定是否调用联网搜索和深度思考模型，信息足够时直接生成回复"""
+    
+    if not expert_orchestration_client:
+        logger.warning("[专家模式][编排器] client未初始化，跳过编排")
+        return {"need_search": False, "need_deep_thinking": False, "need_more_info": False, 
+                "search_keywords": [], "analysis_text": "编排器未初始化"}
+    
+    start_time = time.time()
+    
+    system_prompt = """你是智能编排器，分析问题并决定工具调用。
+
+【核心指令】
+- 深度思考是专家模式的核心！除非问题极其简单，否则必须调用深度思考模型
+- 深度思考模型能处理图片分析、复杂推理、多步分析、创造性问题
+- 只有纯问候（你好、谢谢）或极其简单的常识（1+1=2）才跳过深度思考
+
+【工具】
+1. 搜索：获取最新信息（天气、新闻、股价等）
+2. 深度思考：分析图片、复杂推理、深入分析（优先使用！）
+
+【输出格式】JSON
+{"need_search": true/false, "search_keywords": ["关键词"], "need_deep_thinking": true/false, "need_more_info": true/false, "analysis_text": "简短分析"}
+
+【规则】
+- 需要搜索或深度思考 → need_more_info=true
+- 信息足够 → need_more_info=false
+- 深度思考：有图片必调用；复杂问题必调用；包含"为什么/如何/分析/解释"必调用
+- 最后一次迭代必须设置need_more_info=false
+
+【示例】
+用户："这张图片里的天气怎么样？" → {"need_search":true,"search_keywords":["北京今日天气"],"need_deep_thinking":true,"need_more_info":true,"analysis_text":"需要搜索+图片分析"}
+用户："你是谁？" → {"need_search":false,"search_keywords":[],"need_deep_thinking":false,"need_more_info":false,"analysis_text":"简单问候"}
+用户："为什么天空是蓝色的？" → {"need_search":false,"search_keywords":[],"need_deep_thinking":true,"need_more_info":true,"analysis_text":"需要深度解释"}"""
+    
+    # 构建对话历史文本
+    history_text = ""
+    if history:
+        recent_history = history[-10:]  # 只取最近10条
+        for msg in recent_history:
+            role = msg.get("role", "")
+            content = msg.get("content", "")[:500]  # 每条消息截断到500字符
+            if role and content:
+                role_cn = "用户" if role == "user" else "助手"
+                history_text += f"\n{role_cn}：{content}"
+    
+    user_prompt = f"""当前迭代：第 {iteration}/{max_iterations} 次
+是否最后一次迭代：{'是' if is_last_iteration else '否'}
+
+用户提问：{message}
+
+图片/文件提取内容：
+{extracted_text[:3000] if extracted_text else '无'}
+
+上下文信息：
+{context_text[:2000]}
+
+对话历史（最近10条）：
+{history_text if history_text else '无'}
+
+已有工具调用结果：
+{json.dumps(tool_results, ensure_ascii=False) if tool_results else '无'}
+
+是否有图片：{'是' if has_images else '否'}
+
+请分析是否需要调用联网搜索和深度思考模型，并生成搜索关键词。
+如果是最后一次迭代，请必须生成完整的reply_content。"""
+    
+    max_retries = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = await expert_orchestration_client.chat.completions.create(
+                model=EXPERT_ORCHESTRATION_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                stream=False,
+                temperature=0.7,
+                max_tokens=3000
+            )
+            
+            if response.usage:
+                logger.info(f"[专家模式][编排器] Token消耗(模型:{EXPERT_ORCHESTRATION_MODEL}): "
+                            f"prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, "
+                            f"total={response.usage.total_tokens}")
+            
+            if response.choices and response.choices[0].message and response.choices[0].message.content:
+                content = response.choices[0].message.content.strip()
+                content = _clean_json_response(content)
+                
+                try:
+                    result = json.loads(content)
+                    if isinstance(result, dict):
+                        return {
+                            "need_search": result.get("need_search", False),
+                            "search_keywords": result.get("search_keywords", []),
+                            "need_deep_thinking": result.get("need_deep_thinking", False),
+                            "need_more_info": result.get("need_more_info", False),
+                            "analysis_text": result.get("analysis_text", "")
+                        }
+                except json.JSONDecodeError as je:
+                    logger.warning(f"[专家模式][编排器] 第{attempt}次调用JSON解析失败: {je}")
+                    if attempt < max_retries:
+                        user_prompt = f"""用户提问：{message}
+
+图片/文件提取内容：
+{extracted_text[:3000] if extracted_text else '无'}
+
+上下文信息：
+{context_text[:2000]}
+
+已有工具调用结果：
+{json.dumps(tool_results, ensure_ascii=False) if tool_results else '无'}
+
+是否有图片：{'是' if has_images else '否'}
+
+请分析是否需要调用联网搜索和深度思考模型，并生成搜索关键词。
+
+【强制要求】
+必须输出严格的JSON格式，不要包含任何markdown代码块标记，不要包含任何解释文字。
+只输出JSON对象：{{"need_search": true/false, "search_keywords": [...], "need_deep_thinking": true/false, "need_more_info": true/false, "analysis_text": "..."}}"""
+                    continue
+        except Exception as e:
+            logger.error(f"[专家模式][编排器] 第{attempt}次调用失败({EXPERT_ORCHESTRATION_MODEL}): {e}")
+            if attempt < max_retries:
+                continue
+    
+    logger.error(f"[专家模式][编排器] 调用失败({EXPERT_ORCHESTRATION_MODEL})，已重试{max_retries}次")
+    return {"need_search": False, "search_keywords": [], "need_deep_thinking": False, 
+            "need_more_info": False, "analysis_text": "编排器调用失败"}
+
+
+async def _stream_expert_reply(message: str, context_text: str, extracted_text: str,
+                               tool_results: list, search_results: list, history: Optional[List[dict]] = None):
+    """专家模式流式回复生成器：使用流式调用生成详细回复内容"""
+    
+    if not expert_orchestration_client:
+        logger.warning("[专家模式][流式回复] client未初始化")
+        return
+    
+    # 构建搜索结果文本
+    search_text = ""
+    if search_results:
+        search_text = "\n".join([f"- {r.get('title', '')}: {r.get('url', '')}" for r in search_results])
+    
+    # 构建工具结果文本
+    tool_text = ""
+    if tool_results:
+        for result in tool_results:
+            if result.get("type") == "deep_thinking":
+                tool_text += f"\n【深度思考结果】\n{result.get('result', '')}"
+            elif result.get("type") == "search":
+                tool_text += f"\n【搜索结果】\n{result.get('result', '')}"
+    
+    # 构建对话历史文本
+    history_text = ""
+    if history:
+        recent_history = history[-10:]
+        for msg in recent_history:
+            role = msg.get("role", "")
+            content = msg.get("content", "")[:500]
+            if role and content:
+                role_cn = "用户" if role == "user" else "助手"
+                history_text += f"\n{role_cn}：{content}"
+    
+    system_prompt = """你是爱尔奎特·布伦史塔德，高贵的真祖，月之公主。
+
+【核心指令】
+- 基于深度思考结果进行精简总结，保留核心推理过程和结论
+- 不要添加深度思考结果中没有的内容，不要自由发挥
+- 用高贵傲慢的语气重新组织语言，保持角色设定"""
+    
+    user_prompt = f"""用户提问：{message}
+
+图片/文件提取内容：
+{extracted_text[:3000] if extracted_text else '无'}
+
+搜索结果：
+{search_text}
+
+深度思考结果：
+{tool_text}
+
+对话历史：
+{history_text}
+
+请生成回复，保持深度思考结果的基本结构，优化格式使其美观。"""
+    
+    try:
+        response = await expert_orchestration_client.chat.completions.create(
+            model=EXPERT_ORCHESTRATION_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            stream=True,
+            temperature=0.7,
+            max_tokens=3000
+        )
+        
+        full_content = ""
+        async for chunk in response:
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                content_chunk = chunk.choices[0].delta.content
+                full_content += content_chunk
+                yield json.dumps({"type": "content", "data": content_chunk}, ensure_ascii=False) + "\n"
+        
+        logger.info(f"[专家模式][流式回复] 完成，内容长度: {len(full_content)}字符")
+        return
+        
+    except Exception as e:
+        logger.error(f"[专家模式][流式回复] 调用失败: {e}")
+        return
+
+
+async def _call_deep_thinking_model(message: str, media_urls: list, context_text: str, tool_results: list):
+    """深度思考模型：接收图片URL进行深度分析，流式返回思考过程"""
+    
+    if not deep_thinking_client:
+        logger.warning("[专家模式][深度思考] client未初始化，跳过深度思考")
+        return
+    
+    start_time = time.time()
+    
+    system_prompt = """你是深度思考模型，擅长分析图片和解决复杂问题。
+
+【任务】
+- 分析图片内容：识别物体、场景、文字、图表
+- 解决复杂问题：多步推理、深入分析、创造性思考
+- 输出思考过程：一步一步展示你的真实推理过程
+
+【输出要求】
+- 用自然语言写出你的思考过程，不要刻意格式化
+- 先分析问题，再逐步推理，最后给出结论
+- 推理过程要详细，展示你的分析思路
+- 结论要明确，回答用户的问题"""
+    
+    # 构建用户消息（包含图片URL）
+    user_content = [{"type": "text", "text": f"用户提问：{message}\n\n上下文：{context_text}"}]
+    for url in media_urls:
+        user_content.append({"type": "image_url", "image_url": {"url": url}})
+    
+    # 添加工具调用结果
+    if tool_results:
+        results_text = "\n".join([
+            f"【{r['type']}】\n{r['context'] if 'context' in r else r['result']}" 
+            for r in tool_results 
+            if 'context' in r or 'result' in r
+        ])
+        system_prompt += f"\n\n【已有工具调用结果】\n{results_text}"
+    
+    # 发送深度思考开始状态
+    yield json.dumps({"type": "thinking_start", "data": {"message": "正在深度分析图片..."}}, ensure_ascii=False) + "\n"
+    logger.info(f"[专家模式][深度思考] 开始分析图片: {len(media_urls)}张图片")
+    
+    try:
+        response = await deep_thinking_client.chat.completions.create(
+            model=EXPERT_DEEP_THINKING_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            stream=True,
+            temperature=0.3
+        )
+        
+        logger.info(f"[专家模式][深度思考] 成功连接到模型API({EXPERT_DEEP_THINKING_MODEL}), 开始流式传输")
+        
+        chunk_count = 0
+        total_content = ""
+        async for chunk in response:
+            if chunk.choices and chunk.choices[0].delta:
+                content = chunk.choices[0].delta.content
+                if content:
+                    chunk_count += 1
+                    total_content += content
+                    # 发送思考过程的流式消息
+                    yield json.dumps({"type": "thinking", "data": content}, ensure_ascii=False) + "\n"
+                    logger.debug(f"[专家模式][深度思考] 思考过程分片 {chunk_count}: '{content[:30]}...'")
+        
+        duration = time.time() - start_time
+        
+        if hasattr(response, 'usage') and response.usage:
+            logger.info(f"[专家模式][深度思考] Token消耗(模型:{EXPERT_DEEP_THINKING_MODEL}): "
+                        f"prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, "
+                        f"total={response.usage.total_tokens}, 耗时={duration:.2f}秒")
+        
+        logger.info(f"[专家模式][深度思考] 完成, 总分片数={chunk_count}, 内容长度={len(total_content)}字符")
+    
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(f"[专家模式][深度思考] 失败({EXPERT_DEEP_THINKING_MODEL}): {str(e)}，耗时={duration:.2f}秒")
+        yield json.dumps({"type": "thinking_error", "data": {"error": str(e)}}, ensure_ascii=False) + "\n"
+
+
 async def generate_summary(messages: Optional[List[dict]], existing_summary: Optional[str]):
-    """
-    生成对话摘要
-    :param messages: 对话消息列表
-    :param existing_summary: 已有摘要（用于增量更新）
-    :return: 生成的摘要内容
-    """
-    logger.info(f"生成摘要: 消息数量={len(messages) if messages else 0}, 已有摘要={'是' if existing_summary else '否'}")
+    logger.info(f"[摘要生成] 开始: 消息数量={len(messages) if messages else 0}, 已有摘要={'是' if existing_summary else '否'}")
 
     messages_text = ""
     if messages:
@@ -891,9 +1444,6 @@ async def generate_summary(messages: Optional[List[dict]], existing_summary: Opt
                 else:
                     content = f"[用户上传了文件]\n提问：{content}"
             messages_text += f"{role}: {content}\n"
-        
-        logger.debug(f"消息文本: {messages_text[:200]}..." if len(messages_text) > 200
-                     else f"消息文本: {messages_text}")
 
     system_prompt = """你是一个专业的对话摘要助手。请根据对话内容生成结构化事实摘要。
 
@@ -902,14 +1452,7 @@ async def generate_summary(messages: Optional[List[dict]], existing_summary: Opt
 2. 使用JSON格式输出，包含以下字段：
    - "key_points": 关键要点数组（3-5条）
    - "entities": 涉及的实体/人物列表
-   - "summary": 简短的自然语言摘要（100字以内）
-
-示例输出格式：
-{
-  "key_points": ["要点1", "要点2", "要点3"],
-  "entities": ["实体1", "实体2"],
-  "summary": "简短摘要..."
-}"""
+   - "summary": 简短的自然语言摘要（100字以内）"""
 
     user_prompt = f"""请根据以下对话内容生成结构化事实摘要：
 
@@ -934,20 +1477,20 @@ async def generate_summary(messages: Optional[List[dict]], existing_summary: Opt
 
         if response.choices and response.choices[0].message and response.choices[0].message.content:
             summary_content = response.choices[0].message.content.strip()
-            logger.info(f"摘要生成成功: 长度={len(summary_content)}")
+            logger.info(f"[摘要生成] 成功: 长度={len(summary_content)}")
             return summary_content
         else:
-            logger.warning("未收到模型返回的摘要内容")
+            logger.warning("[摘要生成] 未收到模型返回的摘要内容")
             return None
 
     except Exception as e:
-        logger.error(f"生成摘要出错: {str(e)}")
+        logger.error(f"[摘要生成] 出错: {str(e)}")
         return None
 
 
 @app.post("/summarize")
 async def summarize(request: SummarizeRequest):
-    logger.info(f"收到摘要请求: 消息数量={len(request.messages) if request.messages else 0} 条")
+    logger.info(f"[API入口] 收到摘要请求: 消息数量={len(request.messages) if request.messages else 0} 条")
 
     summary = await generate_summary(request.messages, request.existing_summary)
 
@@ -970,10 +1513,10 @@ async def delete_memory(request: DeleteMemoryRequest, request_obj: Request):
     header_secret = request_obj.headers.get("X-Internal-Secret", "")
     
     if not internal_secret or not header_secret or not header_secret == internal_secret:
-        logger.warning(f"内部接口认证失败: /memory/delete, sessionId={request.session_id}")
+        logger.warning(f"[内存删除] 内部接口认证失败: sessionId={request.session_id}")
         raise HTTPException(status_code=403, detail="内部接口认证失败")
     
-    logger.info(f"收到删除记忆请求: sessionId={request.session_id}, 类型={type(request.session_id)}")
+    logger.info(f"[内存删除] 收到请求: sessionId={request.session_id}, 类型={type(request.session_id)}")
     
     try:
         if not memory_service._initialized:
@@ -993,11 +1536,11 @@ async def delete_memory(request: DeleteMemoryRequest, request_obj: Request):
             )
         )
         
-        logger.info(f"Qdrant记忆删除完成: sessionId={request.session_id}, 已删除{result.count if hasattr(result, 'count') else '未知'}条记录")
+        logger.info(f"[内存删除] 完成: sessionId={request.session_id}, 已删除{result.count if hasattr(result, 'count') else '未知'}条记录")
         
         return {"success": True, "message": "记忆删除成功"}
     except Exception as e:
-        logger.error(f"删除记忆失败: sessionId={request.session_id}, 错误={str(e)}")
+        logger.error(f"[内存删除] 失败: sessionId={request.session_id}, 错误={str(e)}")
         raise HTTPException(status_code=500, detail=f"删除记忆失败: {str(e)}")
 
 
