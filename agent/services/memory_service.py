@@ -469,7 +469,7 @@ Assistant: 你好
                 query_filter=models.Filter(
                     must=[models.FieldCondition(
                         key="sessionId",
-                        match=models.MatchValue(value=session_id)
+                        match=models.MatchValue(value=str(session_id))  # 强制转换为字符串
                     )]
                 ),
                 limit=5,
@@ -541,7 +541,7 @@ Assistant: 你好
 
             payload = {
                 "userId": user_id,
-                "sessionId": session_id,
+                "sessionId": str(session_id),  # 强制转换为字符串，确保与删除时的类型一致
                 "content": content,
                 "type": unit.get("type", "FACTS"),
                 "importance_score": unit.get("importance_score", 0.5),
@@ -606,7 +606,7 @@ Assistant: 你好
                 query_filter=models.Filter(
                     must=[models.FieldCondition(
                         key="sessionId",
-                        match=models.MatchValue(value=session_id)
+                        match=models.MatchValue(value=str(session_id))  # 强制转换为字符串
                     )]
                 ),
                 limit=top_k,
@@ -636,7 +636,7 @@ Assistant: 你好
                             must=[
                                 models.FieldCondition(
                                     key="sessionId",
-                                    match=models.MatchValue(value=session_id)
+                                    match=models.MatchValue(value=str(session_id))  # 强制转换为字符串
                                 ),
                                 models.FieldCondition(
                                     key="bm25_keywords",
