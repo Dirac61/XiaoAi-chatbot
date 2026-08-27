@@ -203,7 +203,9 @@ public class SessionAsyncService {
                                 detail.setMessages(updatedJson);
                                 detail.setUpdatedAt(LocalDateTime.now());
                                 sessionDetailMapper.updateById(detail);
-                                logger.info("MySQL消息内容更新成功: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                                // 媒体提取、搜索结果、expertTrace 每类消息各一次回写，每次用户消息 3+ 条
+                                // 统一降 DEBUG；失败/找不到保持 WARN/ERROR
+                                logger.debug("MySQL消息内容更新成功: sessionId={}, messageUuid={}", sessionId, messageUuid);
                                 found = true;
                                 break;
                             }

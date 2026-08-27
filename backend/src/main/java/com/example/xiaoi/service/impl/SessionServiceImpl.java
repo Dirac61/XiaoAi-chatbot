@@ -234,10 +234,12 @@ public class SessionServiceImpl implements SessionService {
 
         // 同步判断是否需要触发摘要，触发则异步执行（避免阻塞请求线程）
         if (shouldTriggerSummary(turnCount)) {
-            logger.info("触发摘要提取: sessionId={}, 轮次={}", sessionId, turnCount);
+            // 摘要触发只打 DEBUG（每 5 轮一次的固定事件，INFO 价值低且和「摘要已保存」的异步 INFO 重复）
+            logger.debug("触发摘要提取: sessionId={}, 轮次={}", sessionId, turnCount);
             // 先同步获取历史消息（从 Redis 读，毫秒级），再传给异步方法
             // 避免在异步线程中再次查询 Redis，也避免循环依赖
             Map<String, Object> sessionMessages = getSessionMessages(sessionId);
+            @SuppressWarnings("unchecked")
             List<Map<String, Object>> messages = (List<Map<String, Object>>) sessionMessages.get("messages");
             asyncService.asyncExtractAndSaveSummary(sessionId, messages);
         }
@@ -326,67 +328,158 @@ public class SessionServiceImpl implements SessionService {
 
     @Override
     public void updateMessageContent(Long sessionId, String messageUuid, String message, String extractedText) {
-        logger.info("开始更新消息内容: sessionId={}, messageUuid={}, extractedTextLength={}", 
-            sessionId, messageUuid, extractedText != null ? extractedText.length() : 0);
-        
+        // 老 4 参数入口：保持对非扩展调用完全兼容；直接委托给 5 参数新入口（expertTrace 传 null 表示不更新该字段）
+        updateMessageContent(sessionId, messageUuid, message, extractedText, null);
+    }
+
+    @Override
+    public void updateMessageContent(Long sessionId, String messageUuid, String message, String extractedText, String expertTrace) {
+        // 统一多字段回写入口：复用现成 /api/message/update-content 通路（已在拦截器白名单，不会 401）。
+        // 参数策略：哪个字段非空就更新消息 JSON 里的哪个字段；空(null/"") 不覆盖原值。
+        //   - message:        用户提问正文（用户消息 JSON.content）
+        //   - extractedText:  图片提取文本（用户消息 JSON.extractedText）
+        //   - expertTrace:    专家模式编排+工具执行跟踪（assistant 消息 JSON.expertTrace）
+        // 设计好处：原来需要分别调用 update-content + update-expert-trace 导致两次 Redis 扫描+两次 MySQL 异步回写，
+        // 现在一次扫描就把所有字段一次性合并，减少 IO；同时 expertTrace 不再需要新增 URL 导致白名单不同步。
+        boolean hasMsg = message != null && !message.isEmpty();
+        boolean hasExt = extractedText != null && !extractedText.isEmpty();
+        boolean hasExp = expertTrace != null && !expertTrace.isEmpty();
+        logger.debug("开始更新消息(多字段合并): sessionId={}, messageUuid={}, messageLen={}, extractedLen={}, expertLen={}",
+            sessionId, messageUuid,
+            hasMsg ? message.length() : 0,
+            hasExt ? extractedText.length() : 0,
+            hasExp ? expertTrace.length() : 0);
+
+        if (!hasMsg && !hasExt && !hasExp) {
+            // 防御：三个字段都空 → 没有任何实际更新意义，直接返回，避免无谓 Redis 扫描
+            logger.debug("多字段回写字段全空，跳过: sessionId={}, messageUuid={}", sessionId, messageUuid);
+            return;
+        }
+        // 【消息覆盖防御】根据本次要更新的字段决定"只能命中 role=xxx"：
+        //   - hasMsg || hasExt → 用户侧字段，必须命中 role=user；
+        //   - hasExp → 专家模式跟踪，必须命中 role=assistant；
+        //   - hasUserFields 和 hasAssistantFields 同时 true → 非法调用（一次调用不能同时更新 user+assistant 两种不同字段），直接 ERROR 返回，
+        //     不扫描不覆盖，防止"用户消息被写 expertTrace"或"assistant 消息被覆盖正文"等你反馈的错乱。
+        boolean hasUserFields = hasMsg || hasExt;
+        boolean hasAssistantFields = hasExp;
+        if (hasUserFields && hasAssistantFields) {
+            logger.error("多字段回写字段组合非法：一次调用同时包含 user侧字段(message/extractedText) 和 assistant侧字段(expertTrace)，" +
+                    "跳过以避免覆盖错位: sessionId={}, messageUuid={}", sessionId, messageUuid);
+            return;
+        }
+
         try {
             String redisKey = REDIS_KEY_PREFIX + sessionId;
             List<String> redisMessages = redisTemplate.opsForList().range(redisKey, 0, -1);
-            
+
             if (redisMessages != null) {
-                logger.info("Redis中找到{}条消息", redisMessages.size());
+                logger.debug("Redis中找到{}条消息", redisMessages.size());
+                boolean matched = false;
                 for (int i = 0; i < redisMessages.size(); i++) {
                     try {
-                        Map<String, Object> msg = objectMapper.readValue(redisMessages.get(i), 
+                        Map<String, Object> msg = objectMapper.readValue(redisMessages.get(i),
                             new TypeReference<Map<String, Object>>() {});
                         String uuid = (String) msg.get("messageUuid");
                         logger.debug("检查消息[{}]: messageUuid={}", i, uuid);
                         if (messageUuid.equals(uuid)) {
-                            msg.put("extractedText", extractedText);
+                            // 【role 校验】防止 UUID 对到错误的消息：
+                            //  找到的 msg.role 必须与本次更新语义匹配，否则 ERROR 不覆盖。
+                            //  - user侧字段更新 -> role 必须是 "user"；
+                            //  - assistant侧字段更新 -> role 必须是 "assistant"；
+                            //  若都没有（理论上不会，hasUserFields/hasAssistantFields 同时为假已在上文 return），则放行。
+                            String role = (String) msg.get("role");
+                            if (hasUserFields && !"user".equals(role)) {
+                                logger.error("按 UUID 命中的消息 role 非法（更新 user 侧字段但 role={}），拒绝覆盖: " +
+                                        "sessionId={}, messageUuid={}, index={}", role, sessionId, messageUuid, i);
+                                break;
+                            }
+                            if (hasAssistantFields && !"assistant".equals(role)) {
+                                logger.error("按 UUID 命中的消息 role 非法（更新 assistant 侧字段但 role={}），拒绝覆盖: " +
+                                        "sessionId={}, messageUuid={}, index={}", role, sessionId, messageUuid, i);
+                                break;
+                            }
+                            // 按非空策略逐个字段更新
+                            if (hasMsg) msg.put("content", message);
+                            if (hasExt) msg.put("extractedText", extractedText);
+                            if (hasExp) {
+                                // expertTrace: 先反序列化成对象再塞，避免双重 JSON 转义字符串（与 updateMessageExpertTrace 逻辑一致）
+                                Object expertTraceObj;
+                                try {
+                                    expertTraceObj = objectMapper.readValue(expertTrace, Object.class);
+                                } catch (Exception ex) {
+                                    logger.warn("[专家模式] expertTrace 不是合法 JSON，降级为字符串保存: {}", ex.getMessage());
+                                    expertTraceObj = expertTrace;
+                                }
+                                msg.put("expertTrace", expertTraceObj);
+                            }
                             String updatedJson = objectMapper.writeValueAsString(msg);
                             redisTemplate.opsForList().set(redisKey, i, updatedJson);
-                            logger.info("Redis消息内容更新成功: sessionId={}, messageUuid={}", sessionId, messageUuid);
-                            
+                            logger.debug("Redis消息多字段合并更新成功: sessionId={}, messageUuid={}, index={}, fields=message[{}]|ext[{}]|exp[{}]",
+                                sessionId, messageUuid, i, hasMsg, hasExt, hasExp);
+
+                            // MySQL：一次异步回写就把三个字段的变更都同步进 DB（替代原来 2~3 次异步回写）
                             asyncService.asyncUpdateMessageContentToDb(sessionId, messageUuid, updatedJson);
+                            matched = true;
                             break;
                         }
                     } catch (JsonProcessingException e) {
-                        logger.error("解析Redis消息失败: {}", e.getMessage());
+                        logger.error("解析Redis消息失败: {}", e.getMessage(), e);
                     }
                 }
+                if (!matched) {
+                    logger.warn("Redis中未找到匹配 messageUuid 的消息: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                }
             } else {
-                logger.warn("Redis中未找到消息: sessionId={}", sessionId);
+                logger.warn("Redis中未找到会话消息: sessionId={}", sessionId);
             }
         } catch (Exception e) {
-            logger.error("更新消息内容失败: sessionId={}, messageUuid={}, 错误={}", sessionId, messageUuid, e.getMessage(), e);
+            logger.error("多字段合并更新消息失败: sessionId={}, messageUuid={}, 错误={}", sessionId, messageUuid, e.getMessage(), e);
         }
     }
 
     @Override
     public void updateMessageSearchResults(Long sessionId, String messageUuid, String searchResults) {
-        logger.info("开始更新消息搜索结果: sessionId={}, messageUuid={}, searchResultsLength={}", 
-            sessionId, messageUuid, searchResults != null ? searchResults.length() : 0);
-        
+        // 搜索结果回写：每次搜索都会触发一次，降到 DEBUG；真正需要看的证据是 [聊天完成] replyLen/searchLen 汇总行
+        // 搜索结果是 assistant 消息的字段（快速模式/专家模式共用），必须命中 role=assistant，避免被误写到用户消息里
+        int srLen = searchResults != null ? searchResults.length() : 0;
+        logger.debug("开始更新消息搜索结果: sessionId={}, messageUuid={}, searchResultsLength={}",
+            sessionId, messageUuid, srLen);
+
         try {
             String redisKey = REDIS_KEY_PREFIX + sessionId;
             List<String> redisMessages = redisTemplate.opsForList().range(redisKey, 0, -1);
-            
+
             if (redisMessages != null) {
+                boolean matched = false;
                 for (int i = 0; i < redisMessages.size(); i++) {
                     try {
-                        Map<String, Object> msg = objectMapper.readValue(redisMessages.get(i), 
+                        Map<String, Object> msg = objectMapper.readValue(redisMessages.get(i),
                             new TypeReference<Map<String, Object>>() {});
                         String uuid = (String) msg.get("messageUuid");
                         if (messageUuid.equals(uuid)) {
+                            // 【role 防御】搜索结果（searchResults）字段只能存在 assistant 消息里。
+                            String role = (String) msg.get("role");
+                            if (!"assistant".equals(role)) {
+                                logger.error("按 UUID 命中的消息 role 非法（更新 searchResults 但 role={}），拒绝覆盖: " +
+                                        "sessionId={}, messageUuid={}, index={}", role, sessionId, messageUuid, i);
+                                break;
+                            }
                             msg.put("searchResults", searchResults);
                             String updatedJson = objectMapper.writeValueAsString(msg);
                             redisTemplate.opsForList().set(redisKey, i, updatedJson);
-                            logger.info("Redis消息搜索结果更新成功: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                            logger.debug("Redis消息搜索结果更新成功: sessionId={}, messageUuid={}, index={}, searchLen={}",
+                                sessionId, messageUuid, i, srLen);
+                            asyncService.asyncUpdateMessageContentToDb(sessionId, messageUuid, updatedJson);
+                            matched = true;
                             break;
                         }
                     } catch (JsonProcessingException e) {
-                        logger.error("解析Redis消息失败: {}", e.getMessage());
+                        logger.error("解析Redis消息失败: {}", e.getMessage(), e);
                     }
+                }
+                if (!matched) {
+                    logger.warn("Redis中未找到匹配 searchResults 回写的 assistant 消息: sessionId={}, messageUuid={}",
+                        sessionId, messageUuid);
                 }
             } else {
                 logger.warn("Redis中未找到消息: sessionId={}", sessionId);
@@ -397,48 +490,64 @@ public class SessionServiceImpl implements SessionService {
     }
 
     @Override
+    public void updateMessageExpertTrace(Long sessionId, String messageUuid, String expertTrace) {
+        // 兼容旧 Agent：仍可能调用 /api/message/update-expert-trace 独立 URL。
+        // 不再保留独立实现，统一委托给 5 参数的合并入口（expertTrace 非空时更新即可），
+        // 既避免"新增 URL 需要新 jar 白名单"的问题，也避免两条实现路径未来不同步。
+        updateMessageContent(sessionId, messageUuid, null, null, expertTrace);
+    }
+
+    @Override
     public boolean deleteSession(Long sessionId) {
+        // 删除会话拆成：开始/汇总各 1 条 INFO；中间每一步（OSS/MySQL 两行/Redis/Qdrant/完成）全部降 DEBUG 或合并，
+        // 避免一删会话就 7~8 行 INFO 刷屏。
         logger.info("开始删除会话: sessionId={}", sessionId);
-        
+        int deletedMediaCount = 0;
+        int failedMediaCount = 0;
+        long sessionDetailRows = 0;
+        long sessionRows = 0;
+
         try {
             LambdaQueryWrapper<SessionDetail> queryWrapper = new LambdaQueryWrapper<>();
             queryWrapper.eq(SessionDetail::getSessionId, sessionId);
             List<SessionDetail> sessionDetails = sessionDetailMapper.selectList(queryWrapper);
-            
+
             for (SessionDetail detail : sessionDetails) {
                 String mediaUrl = detail.getMediaUrl();
                 if (mediaUrl != null && !mediaUrl.isEmpty()) {
                     // 使用哈希去重删除（引用计数递减，为 0 时自动删除 OSS）
                     boolean deleted = ossUploadService.deleteWithDedup(mediaUrl);
                     if (deleted) {
-                        logger.info("OSS文件删除成功（哈希去重）: url={}", mediaUrl);
+                        deletedMediaCount++;
+                        logger.debug("OSS文件删除成功（哈希去重）: url={}", mediaUrl);
                     } else {
+                        failedMediaCount++;
                         logger.warn("OSS文件删除失败: url={}", mediaUrl);
                     }
                 }
             }
-            
-            sessionDetailMapper.delete(queryWrapper);
-            logger.info("删除MySQL会话详情记录成功: sessionId={}", sessionId);
-            
-            sessionMapper.deleteById(sessionId);
-            logger.info("删除MySQL会话记录成功: sessionId={}", sessionId);
-            
+
+            sessionDetailRows = sessionDetailMapper.delete(queryWrapper);
+            sessionRows = sessionMapper.deleteById(sessionId);
+
             String sessionKey = REDIS_KEY_PREFIX + sessionId;
             String turnKey = REDIS_TURN_COUNT_PREFIX + sessionId;
             String summaryKey = "session:summary:" + sessionId;
             String duplicateKey = "memory:duplicate:" + sessionId;
-            
+
             redisTemplate.delete(sessionKey);
             redisTemplate.delete(turnKey);
             redisTemplate.delete(summaryKey);
             redisTemplate.delete(duplicateKey);
-            logger.info("删除Redis会话缓存成功: sessionId={}", sessionId);
-            
+            logger.debug("删除Redis会话缓存成功: sessionId={}", sessionId);
+
             asyncService.asyncDeleteQdrantMemory(sessionId);
-            logger.info("异步删除Qdrant记忆数据: sessionId={}", sessionId);
-            
-            logger.info("会话删除完成: sessionId={}", sessionId);
+            logger.debug("异步删除Qdrant记忆数据: sessionId={}", sessionId);
+
+            logger.info(
+                    "会话删除完成: sessionId={} detailRows={} sessionRows={} mediaDeleted={} mediaFailed={}",
+                    sessionId, sessionDetailRows, sessionRows, deletedMediaCount, failedMediaCount
+            );
             return true;
         } catch (Exception e) {
             logger.error("删除会话失败: sessionId={}, 错误={}", sessionId, e.getMessage(), e);

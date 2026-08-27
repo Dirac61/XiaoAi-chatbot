@@ -373,133 +373,110 @@ const sendMessage = async () => {
  const reader = response.body.getReader();
  const decoder = new TextDecoder();
  let lineBuffer = '';
+ // 【日志降噪 & 流式证据】统一一条 SSE DONE 汇总：收到多少 JSON 行、正文/搜索/思考各多少块、最终内容长度
+ // 避免后续有人逐块 console.log 刷屏，同时给 F12 里一个"到底有没有收到字"的明确证据
+ const sseStats = { lines: 0, jsonLines: 0, contentPieces: 0, thinkingPieces: 0, searchPieces: 0 };
+ const botMsg = () => messages.value[botMessageIndex];
+ // 把"单行解析 + 赋值"抽成一个函数，消除 line loop 与 remaining 分支两处重复（之前两处各写一遍易改漏）
+ const applyChunkLine = (line) => {
+   if (!line) return;
+   sseStats.lines += 1;
+   if (line.startsWith('{')) {
+     try {
+       const jsonChunk = JSON.parse(line);
+       sseStats.jsonLines += 1;
+       const type = jsonChunk.type;
+       const data = jsonChunk.data;
+       if (type === 'content') {
+        // 正式回复内容：保留 isThinking 状态（思考栏 spinner 会保持动画直到流结束）
+        // 但不清除已累积的 thinking 文本 —— 用户要求"思考栏一直显示"，不要因为正文到来就消失
+        botMsg().content += (data || '');
+        sseStats.contentPieces += 1;
+       } else if (type === 'search_results') {
+         botMsg().searchResults = JSON.stringify(data);
+         sseStats.searchPieces += 1;
+       } else if (type === 'search_start') {
+         // 搜索开始状态 - 清除思考状态（互斥）
+         botMsg().searchStatus = {
+           status: 'searching',
+           keywords: data?.keywords || []
+         };
+         botMsg().isThinking = false;
+         botMsg().thinking = '';
+       } else if (type === 'search_summary') {
+         // 搜索摘要（包含搜索结果）
+         botMsg().searchStatus = {
+           status: 'completed',
+           keywords: data?.keywords || [],
+           count: data?.count || 0,
+           duration: data?.duration || 0
+         };
+         if (data?.results) {
+           botMsg().searchResults = JSON.stringify(data.results);
+         }
+         sseStats.searchPieces += 1;
+       } else if (type === 'thinking_start') {
+         // 深度思考开始状态 - 清除搜索状态（互斥）
+         botMsg().isThinking = true;
+         botMsg().thinking = '';
+         if (botMsg().searchStatus?.status === 'searching') {
+           botMsg().searchStatus = null;
+         }
+       } else if (type === 'thinking') {
+         // 思考过程（流式）
+         botMsg().isThinking = true;
+         botMsg().thinking += (data || '');
+         sseStats.thinkingPieces += 1;
+       } else if (type === 'thinking_error') {
+         // 思考错误
+         botMsg().isThinking = false;
+         botMsg().thinking += `\n[思考错误] ${data?.error || '未知错误'}`;
+       }
+       return;
+     } catch (e) {
+       // JSON 解析失败兜底按纯文本写入（非空行，不再打印解析失败原因到 console，避免刷屏）
+       botMsg().content += line;
+       return;
+     }
+   }
+   // 非 JSON 纯文本行（一般是旧模型的"错误: xxx"这类降级响应）
+   botMsg().content += line;
+ };
  try {
  while (true) {
  const { done, value } = await reader.read();
- if (done)
- break;
+ if (done) break;
  lineBuffer += decoder.decode(value, { stream: true });
  let newlineIdx;
  while ((newlineIdx = lineBuffer.indexOf('\n')) >= 0) {
- const line = lineBuffer.substring(0, newlineIdx).trim();
- lineBuffer = lineBuffer.substring(newlineIdx + 1);
- if (!line)
- continue;
- if (line.startsWith('{')) {
- try {
- const jsonChunk = JSON.parse(line);
- if (jsonChunk.type === 'content') {
- // 正式回复内容，清除思考状态
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].content += jsonChunk.data;
- }
- else if (jsonChunk.type === 'search_results') {
- messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data);
- }
- else if (jsonChunk.type === 'search_start') {
- // 搜索开始状态 - 清除思考状态（互斥）
- messages.value[botMessageIndex].searchStatus = {
- status: 'searching',
- keywords: jsonChunk.data?.keywords || []
- };
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].thinking = '';
- }
- else if (jsonChunk.type === 'search_summary') {
- // 搜索摘要（包含搜索结果）
- messages.value[botMessageIndex].searchStatus = {
- status: 'completed',
- keywords: jsonChunk.data?.keywords || [],
- count: jsonChunk.data?.count || 0,
- duration: jsonChunk.data?.duration || 0
- };
- // 同时保存搜索结果
- if (jsonChunk.data?.results) {
- messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data.results);
+   const line = lineBuffer.substring(0, newlineIdx).trim();
+   lineBuffer = lineBuffer.substring(newlineIdx + 1);
+   applyChunkLine(line);
+   scrollToBottom();
  }
  }
- else if (jsonChunk.type === 'thinking_start') {
- // 深度思考开始状态 - 清除搜索状态（互斥）
- messages.value[botMessageIndex].isThinking = true;
- messages.value[botMessageIndex].thinking = '';
- // 如果正在搜索中，清除搜索状态
- if (messages.value[botMessageIndex].searchStatus?.status === 'searching') {
- messages.value[botMessageIndex].searchStatus = null;
- }
- }
- else if (jsonChunk.type === 'thinking') {
- // 思考过程（流式）
- messages.value[botMessageIndex].isThinking = true;
- messages.value[botMessageIndex].thinking += jsonChunk.data;
- }
- else if (jsonChunk.type === 'thinking_error') {
- // 思考错误
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].thinking += `\n[思考错误] ${jsonChunk.data?.error || '未知错误'}`;
- }
- }
- catch (e) {
- messages.value[botMessageIndex].content += line;
- }
- }
- else {
- messages.value[botMessageIndex].content += line;
- }
- scrollToBottom();
- }
- }
+ // 最后残留无换行的半行（也走同一个 apply，避免重复 if-else）
  const remaining = lineBuffer.trim();
- if (remaining) {
- if (remaining.startsWith('{')) {
- try {
- const jsonChunk = JSON.parse(remaining);
- if (jsonChunk.type === 'content') {
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].content += jsonChunk.data;
- }
- else if (jsonChunk.type === 'search_results') {
- messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data);
- }
- else if (jsonChunk.type === 'search_start') {
- messages.value[botMessageIndex].searchStatus = {
- status: 'searching',
- keywords: jsonChunk.data?.keywords || []
- };
- }
- else if (jsonChunk.type === 'search_summary') {
- messages.value[botMessageIndex].searchStatus = {
- status: 'completed',
- keywords: jsonChunk.data?.keywords || [],
- count: jsonChunk.data?.count || 0,
- duration: jsonChunk.data?.duration || 0
- };
- if (jsonChunk.data?.results) {
- messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data.results);
- }
- }
- else if (jsonChunk.type === 'thinking_start') {
- messages.value[botMessageIndex].isThinking = true;
- messages.value[botMessageIndex].thinking = '';
- }
- else if (jsonChunk.type === 'thinking') {
- messages.value[botMessageIndex].isThinking = true;
- messages.value[botMessageIndex].thinking += jsonChunk.data;
- }
- else if (jsonChunk.type === 'thinking_error') {
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].thinking += `\n[思考错误] ${jsonChunk.data?.error || '未知错误'}`;
- }
- }
- catch (e) {
- messages.value[botMessageIndex].content += remaining;
- }
- }
- else {
- messages.value[botMessageIndex].content += remaining;
- }
- }
+ if (remaining) applyChunkLine(remaining);
  } finally {
  reader.releaseLock();
+ // 流结束：统一清除 isThinking spinner（之前 content 到来不清，避免思考栏过早隐藏）
+ // 注意：thinking 文本保留，思考栏仍会显示，只是停止转圈动画
+ if (botMsg()) {
+   botMsg().isThinking = false;
+ }
+ // 【STREAM DONE 诊断】统一一条 F12 可见证据：后端日志 [SSE完成] + 前端 sseStats 能对得上
+ console.debug('[STREAM DONE]', {
+   lines: sseStats.lines,
+   jsonLines: sseStats.jsonLines,
+   contentPieces: sseStats.contentPieces,
+   thinkingPieces: sseStats.thinkingPieces,
+   searchPieces: sseStats.searchPieces,
+   contentLen: (botMsg()?.content || '').length,
+   thinkingLen: (botMsg()?.thinking || '').length,
+   isThinking: botMsg()?.isThinking,
+   searchLen: (botMsg()?.searchResults || '').length,
+ });
  }
  }
  catch (error) {
@@ -863,14 +840,15 @@ const processAudio = async (audioBlob) => {
                   </div>
                 </div>
                 
-                <!-- 正在思考时显示思考过程（优先级高于搜索完成状态） -->
-                <div v-else-if="msg.isThinking && !msg.content" class="thinking-container">
+                <!-- 思考过程（显示在正文上方；只要有思考内容就一直显示，不再因有正文而消失）
+                     说明：思考栏优先级高于搜索完成状态；转圈动画由 isThinking 控制，显示由 thinking 文本非空决定 -->
+                <div v-if="msg.thinking" class="thinking-container">
                   <div class="thinking-header">
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" :class="{ 'thinking-spinner': msg.isThinking }">
                       <circle cx="12" cy="12" r="10"/>
                       <path d="M12 6v6l4 2"/>
                     </svg>
-                    <span>思考中...</span>
+                    <span>{{ msg.isThinking ? '思考中...' : '思考完成' }}</span>
                   </div>
                   <div class="thinking-content">{{ msg.thinking }}</div>
                 </div>
