@@ -98,14 +98,16 @@ public class OSSUploadService {
         long t0 = System.currentTimeMillis();
         String md5 = calculateMd5(file);
         long t1 = System.currentTimeMillis();
-        logger.info("哈希去重上传: original={}, md5={}, type={}, size={}, md5耗时={}ms",
+        // 每次媒体消息都会触发：批量传 10 张图就至少 20 行 INFO，统一降 DEBUG，汇总行留给 [SSE完成]/[聊天完成]
+        logger.debug("哈希去重上传: original={}, md5={}, type={}, size={}, md5耗时={}ms",
                 file.getOriginalFilename(), md5, fileType, file.getSize(), (t1 - t0));
 
         // 事务内查 DB + 可能的 OSS 上传（通过 self 调用使 @Transactional 生效）
         long t2 = System.currentTimeMillis();
         String url = self.uploadInTransaction(file, md5, fileType);
         long t3 = System.currentTimeMillis();
-        logger.info("上传总耗时: original={}, md5={}ms, 事务={}ms, total={}ms",
+        // 总耗时也降 DEBUG：批量上传时按张数线性刷屏
+        logger.debug("上传总耗时: original={}, md5={}ms, 事务={}ms, total={}ms",
                 file.getOriginalFilename(), (t1 - t0), (t3 - t2), (t3 - t0));
         return url;
     }
@@ -139,7 +141,8 @@ public class OSSUploadService {
     public boolean deleteWithDedup(String url) {
         if (url == null || url.isEmpty()) return false;
 
-        logger.info("哈希去重删除: url={}", url);
+        // 删除会话/删除消息才会触发，频次低于上传；但一条消息带 N 个文件就会 N 条，统一降 DEBUG
+        logger.debug("哈希去重删除: url={}", url);
 
         // 1. 通过 URL 查询文件哈希记录
         FileHash record = fileHashMapper.selectByUrl(url);
@@ -155,6 +158,7 @@ public class OSSUploadService {
 
         // 3. 引用为 0 时删除 OSS 文件
         if (result.isDeleteOss()) {
+            // 引用归零是有信息价值的事件（意味着 OSS 真实会被删），保留 INFO
             logger.info("引用归零，删除 OSS 文件: url={}", url);
             return deleteFileDirect(url);
         }
@@ -172,7 +176,8 @@ public class OSSUploadService {
             String objectName = extractObjectNameFromUrl(url);
             if (objectName != null) {
                 ossClient.deleteObject(ossConfig.getBucketName(), objectName);
-                logger.info("OSS 文件直接删除成功: objectName={}", objectName);
+                // 直接删除 OSS 成功：降 DEBUG（与引用归零的 INFO 区分，后者更关键）
+                logger.debug("OSS 文件直接删除成功: objectName={}", objectName);
                 return true;
             }
             return false;
@@ -209,7 +214,7 @@ public class OSSUploadService {
             fileHashMapper.incrementRefCount(md5);
             long t2 = System.currentTimeMillis();
             int newRefCount = existing.getRefCount() + 1;
-            logger.info("数据已存在，引用+1: md5={}, refCount={}, select={}ms, update={}ms",
+            logger.debug("数据已存在，引用+1: md5={}, refCount={}, select={}ms, update={}ms",
                     md5, newRefCount, (t1 - t0), (t2 - t1));
             return existing.getStorageUrl();
         }
@@ -226,7 +231,8 @@ public class OSSUploadService {
             PutObjectRequest request = new PutObjectRequest(ossConfig.getBucketName(), objectName, inputStream);
             ossClient.putObject(request);
             url = "https://" + ossConfig.getBucketName() + "." + ossConfig.getEndpoint() + "/" + objectName;
-            logger.info("文件上传 OSS 成功: original={}, url={}", file.getOriginalFilename(), url);
+            // OSS 首次新文件上传成功：有业务意义的事件，保留 INFO
+            logger.info("文件上传 OSS 成功: original={}, size={}, url={}", file.getOriginalFilename(), file.getSize(), url);
         } catch (Exception e) {
             logger.error("OSS 上传失败: original={}, error={}", file.getOriginalFilename(), e.getMessage());
             throw new IOException("文件上传失败: " + e.getMessage(), e);
@@ -245,7 +251,7 @@ public class OSSUploadService {
         try {
             fileHashMapper.insert(record);
             newRefCount = 1;
-            logger.info("file_hash 记录创建成功: md5={}, refCount=1, size={}", md5, file.getSize());
+            logger.debug("file_hash 记录创建成功: md5={}, refCount=1, size={}", md5, file.getSize());
         } catch (DuplicateKeyException e) {
             // 并发兜底：另一请求先插入了同 hash 的记录
             // 递增引用并使用已有 URL
@@ -254,6 +260,7 @@ public class OSSUploadService {
                 fileHashMapper.incrementRefCount(md5);
                 url = existingAfterLock.getStorageUrl();
                 newRefCount = existingAfterLock.getRefCount() + 1;
+                // 并发冲突是少见但值得看一下的事件，保留 INFO
                 logger.info("并发冲突，使用已有记录: md5={}, refCount={}, url={}",
                         md5, newRefCount, url);
             } else {
@@ -262,7 +269,7 @@ public class OSSUploadService {
             }
         }
 
-        logger.info("事务完成，返回 URL: md5={}, url={}", md5, url);
+        logger.debug("事务完成，返回 URL: md5={}, refCount={}, url={}", md5, newRefCount, url);
         return url;
     }
 
@@ -273,7 +280,7 @@ public class OSSUploadService {
      */
     @Transactional
     public DeleteResult decrementRefInTransaction(String md5, String url) {
-        logger.info("递减引用: md5={}, url={}", md5, url);
+        logger.debug("递减引用: md5={}, url={}", md5, url);
 
         // FOR UPDATE 行锁
         FileHash locked = fileHashMapper.selectForUpdate(md5);
@@ -291,17 +298,18 @@ public class OSSUploadService {
         }
 
         Integer currentCount = fileHashMapper.selectRefCount(md5);
-        logger.info("引用递减完成: md5={}, refCount={}→{}", md5, locked.getRefCount(), currentCount);
+        logger.debug("引用递减完成: md5={}, refCount={}→{}", md5, locked.getRefCount(), currentCount);
 
         if (currentCount != null && currentCount > 0) {
             // 仍有引用 → 保留 OSS
-            logger.info("引用未归零，保留 OSS: md5={}, refCount={}", md5, currentCount);
+            logger.debug("引用未归零，保留 OSS: md5={}, refCount={}", md5, currentCount);
             return DeleteResult.notDeleteOss();
         }
 
         // 引用为 0 → 删除记录
         fileHashMapper.deleteById(locked.getId());
-        logger.info("引用为 0，删除 file_hash 记录: md5={}", md5);
+        // 引用归零删记录：调用方还会打"引用归零，删除 OSS 文件"的 INFO，这里只打 DEBUG
+        logger.debug("引用为 0，删除 file_hash 记录: md5={}", md5);
         return DeleteResult.deleteOss();
     }
 

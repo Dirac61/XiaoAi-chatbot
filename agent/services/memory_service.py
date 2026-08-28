@@ -22,6 +22,22 @@ from config.settings import (
 logger = logging.getLogger("XiaoAi Memory Service")
 
 
+def _extraction_extra_kwargs() -> Dict[str, Any]:
+    """
+    记忆提取模型调用的「关思考」附加参数构造（单文件内聚封装）。
+
+    设计意图：
+    - 记忆提取要求输出严格 JSON 数组，一旦模型开启 thinking（尤其 qwen3.8 系），
+      会先输出 reasoning 文本或 <think> 标签，破坏 JSON 解析，导致提取失败或空数组。
+    - 这里统一对提取调用注入 enable_thinking=False，透传方式兼容 AsyncOpenAI extra_body，
+      不关心当前槽位是 deepseek / qwen3.8 / 其他，extra_body 未知字段通常被忽略，
+      但 qwen3.8 系能被正确关思考，后续你把 EXTRACTION_MODEL 换成 qwen3.8-27b 也无需改代码。
+    :return: 可直接 ** 解包到 chat.completions.create 的 kwargs
+    """
+    logger.debug("[记忆提取] 调用时注入 enable_thinking=False，避免 reasoning 污染 JSON")
+    return {"extra_body": {"enable_thinking": False}}
+
+
 class MemoryService:
     _instance = None
 
@@ -341,6 +357,7 @@ Assistant: 你好
         """
         max_retries = 2
         for attempt in range(1, max_retries + 1):
+            # 记忆提取：强制关闭思考（推理内容会破坏 JSON 数组解析结构，导致提取为空）
             response = await client.chat.completions.create(
                 model=model,
                 messages=[
@@ -348,7 +365,8 @@ Assistant: 你好
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=2000
+                max_tokens=2000,
+                **_extraction_extra_kwargs()
             )
 
             if response.choices and response.choices[0].message and response.choices[0].message.content:

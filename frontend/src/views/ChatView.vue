@@ -46,6 +46,11 @@ const showDeleteConfirm = ref(false);
 const sessionToDelete = ref(null);
 const expandedExtracted = reactive({});
 const expandedSearch = reactive({});
+const expandedSteps = reactive({});
+// 工具调用结果折叠状态（key: "msgIdx-stepIdx"），默认折叠
+const expandedTools = reactive({});
+// 深度思考reasoning折叠状态（key: msgIdx），默认折叠
+const expandedReasoning = reactive({});
 const previewImage = ref(null);
 // 模式切换：fast（快速模式）, expert（专家模式）
 const currentMode = ref('fast');
@@ -146,16 +151,59 @@ const loadMessages = async (page = 1) => {
  });
  if (data.code === 200 && data.data) {
  const newMessages = data.data.messages || [];
- const formattedMessages = newMessages.map(msg => ({
- type: msg.role === 'user' ? 'user' : 'bot',
- content: msg.content,
- messageType: msg.messageType || 'TEXT',
- mediaUrl: msg.mediaUrl,
- mediaUrls: msg.mediaUrls,
- fileNames: msg.fileNames,
- extractedText: msg.extractedText,
- searchResults: msg.searchResults
- }));
+ const formattedMessages = newMessages.map(msg => {
+  const formatted = {
+    type: msg.role === 'user' ? 'user' : 'bot',
+    content: msg.content,
+    messageType: msg.messageType || 'TEXT',
+    mediaUrl: msg.mediaUrl,
+    mediaUrls: msg.mediaUrls,
+    fileNames: msg.fileNames,
+    extractedText: msg.extractedText,
+    searchResults: msg.searchResults,
+    thinking: '',
+    isThinking: false,
+    searchStatus: null,
+    thinkingSteps: [],
+    thinkingStartTime: null,
+    deepThinkingReasoning: '',
+  };
+  // 专家模式历史消息：从 expertTrace 解析出 thinkingSteps + deepThinkingReasoning
+  if (msg.role === 'assistant' && msg.expertTrace) {
+    try {
+      const trace = typeof msg.expertTrace === 'string' ? JSON.parse(msg.expertTrace) : msg.expertTrace;
+      if (trace && trace.history && Array.isArray(trace.history)) {
+        formatted.thinkingSteps = trace.history.map((rec, idx) => ({
+          id: idx + 1,
+          phase: rec.action === 'collect_tools' ? 'planning' : 'thinking',
+          iteration: rec.iteration || (idx + 1),
+          analysis: rec.analysis || '',
+          purpose: rec.purpose || null,
+          action: rec.action || null,
+          tools: (rec.tools || []).map(t => ({
+            tool: t.tool,
+            status: t.success ? 'done' : 'error',
+            summary: `${t.tool}${t.resultCount ? ` · ${t.resultCount} 条结果` : ''}`,
+            durationMs: t.durationMs || 0,
+            resultCount: t.resultCount || 0,
+            error: t.error || null,
+            // 持久化的原始结果（折叠栏展开后显示）
+            rawResult: t.rawResult || null,
+          })),
+          thinking: '',
+          status: 'done',
+        }));
+      }
+      // 深度思考推理链全文（从 expertTrace 加载）
+      if (trace && trace.deepThinkingReasoning) {
+        formatted.deepThinkingReasoning = trace.deepThinkingReasoning;
+      }
+    } catch (e) {
+      console.warn('解析 expertTrace 失败：', e);
+    }
+  }
+  return formatted;
+});
  if (page === 1) {
  messages.value = [...formattedMessages.reverse()];
  }
@@ -284,6 +332,30 @@ const toggleSearch = (index) => {
     expandedSearch[index] = true;
   }
 };
+const toggleThinkingSteps = (index) => {
+  if (expandedSteps[index]) {
+    delete expandedSteps[index];
+  } else {
+    expandedSteps[index] = true;
+  }
+};
+// 切换工具调用结果折叠状态（每个工具独立折叠，三级key: msgIdx-stepIdx-toolIdx）
+const toggleTools = (msgIdx, stepIdx, toolIdx) => {
+  const key = `${msgIdx}-${stepIdx}-${toolIdx}`;
+  if (expandedTools[key]) {
+    delete expandedTools[key];
+  } else {
+    expandedTools[key] = true;
+  }
+};
+// 切换深度思考reasoning折叠状态
+const toggleReasoning = (index) => {
+  if (expandedReasoning[index]) {
+    delete expandedReasoning[index];
+  } else {
+    expandedReasoning[index] = true;
+  }
+};
 const getSearchResults = (searchResultsStr) => {
   if (!searchResultsStr) {
     return [];
@@ -331,7 +403,12 @@ const sendMessage = async () => {
     mediaUrl: capturedUrls ? capturedUrls[0] : null,
     fileNames: finalFileNames
   });
-  const botMessageIndex = messages.value.push({ type: 'bot', content: '', searchResults: null, thinking: '', isThinking: false, searchStatus: null }) - 1;
+  const botMessageIndex = messages.value.push({
+    type: 'bot', content: '', searchResults: null, thinking: '', isThinking: false,
+    searchStatus: null, thinkingSteps: [], thinkingStartTime: Date.now(),
+    // 深度思考推理链全文（独立于步骤列表，单独折叠显示）
+    deepThinkingReasoning: ''
+  }) - 1;
   isLoading.value = true;
   scrollToBottom();
   try {
@@ -373,133 +450,232 @@ const sendMessage = async () => {
  const reader = response.body.getReader();
  const decoder = new TextDecoder();
  let lineBuffer = '';
+ // 【日志降噪 & 流式证据】统一一条 SSE DONE 汇总：收到多少 JSON 行、正文/搜索/思考各多少块、最终内容长度
+ // 避免后续有人逐块 console.log 刷屏，同时给 F12 里一个"到底有没有收到字"的明确证据
+ const sseStats = { lines: 0, jsonLines: 0, contentPieces: 0, thinkingPieces: 0, searchPieces: 0 };
+ const botMsg = () => messages.value[botMessageIndex];
+ // 把"单行解析 + 赋值"抽成一个函数，消除 line loop 与 remaining 分支两处重复（之前两处各写一遍易改漏）
+ const applyChunkLine = (line) => {
+   if (!line) return;
+   sseStats.lines += 1;
+   if (line.startsWith('{')) {
+     try {
+       const jsonChunk = JSON.parse(line);
+       sseStats.jsonLines += 1;
+       const type = jsonChunk.type;
+       const data = jsonChunk.data;
+       if (type === 'content') {
+        // 正式回复内容：保留 isThinking 状态（思考栏 spinner 会保持动画直到流结束）
+        botMsg().content += (data || '');
+        sseStats.contentPieces += 1;
+       } else if (type === 'orchestration_chunk') {
+        // 编排器分析增量文本（流式打字机效果）：
+        // 如果当前没有步骤（或最后一步已完成），创建新的占位步骤
+        const steps = botMsg().thinkingSteps;
+        if (steps.length === 0 || steps[steps.length - 1].status === 'done') {
+          steps.push({
+            id: steps.length + 1,
+            phase: 'planning',
+            iteration: steps.length + 1,
+            analysis: data?.delta || '',
+            purpose: null,
+            action: null,
+            tools: [],
+            thinking: '',
+            status: 'running',
+          });
+        } else {
+          // 追加到当前正在进行的步骤
+          steps[steps.length - 1].analysis += (data?.delta || '');
+        }
+        sseStats.searchPieces += 1;
+       } else if (type === 'orchestration_step') {
+        // 编排步骤完成：更新当前步骤的结构化信息（analysis 已通过 chunk 流式显示）
+        const steps = botMsg().thinkingSteps;
+        if (steps.length > 0) {
+          const lastStep = steps[steps.length - 1];
+          // 更新结构化字段（analysis 不覆盖，保留已流式显示的文本）
+          lastStep.phase = data?.phase || lastStep.phase;
+          lastStep.action = data?.action || lastStep.action;
+          lastStep.purpose = data?.purpose || lastStep.purpose;
+          lastStep.iteration = data?.iteration || lastStep.iteration;
+          // 如果 chunk 没有产生过 analysis（fallback），用 step 里的 analysis 补上
+          if (!lastStep.analysis && data?.analysis) {
+            lastStep.analysis = data.analysis;
+          }
+        } else {
+          // fallback：没有收到过 chunk，直接创建步骤
+          steps.push({
+            id: data?.iteration || 1,
+            phase: data?.phase || 'planning',
+            iteration: data?.iteration || 1,
+            analysis: data?.analysis || '',
+            purpose: data?.purpose || null,
+            action: data?.action || null,
+            tools: [],
+            thinking: '',
+            status: 'running',
+          });
+        }
+        sseStats.searchPieces += 1;
+       } else if (type === 'tool_call_start') {
+        // 工具调用开始：在当前步骤 push 一个 running 状态的占位工具
+        const steps = botMsg().thinkingSteps;
+        // fallback：如果编排器事件未创建步骤，此处补创建一个
+        if (steps.length === 0 || steps[steps.length - 1].status === 'done') {
+          steps.push({
+            id: steps.length + 1,
+            phase: 'executing',
+            iteration: steps.length + 1,
+            analysis: '',
+            purpose: null,
+            action: null,
+            tools: [],
+            thinking: '',
+            status: 'running',
+          });
+        }
+        const currentStep = steps[steps.length - 1];
+        currentStep.tools.push({
+          tool: data?.tool || 'unknown',
+          status: 'running',
+          summary: '',
+          durationMs: null,
+          resultCount: null,
+          params: data?.params || null,
+        });
+     } else if (type === 'tool_call_result') {
+        // 工具调用完成：更新当前步骤中对应工具的状态和结果
+        const steps = botMsg().thinkingSteps;
+        // fallback：如果步骤不存在，补创建一个
+        if (steps.length === 0) {
+          steps.push({
+            id: 1,
+            phase: 'executing',
+            iteration: 1,
+            analysis: '',
+            purpose: null,
+            action: null,
+            tools: [],
+            thinking: '',
+            status: 'running',
+          });
+        }
+        const currentStep = steps[steps.length - 1];
+        // 找到同步骤中对应的 running 工具并更新
+        let tool = currentStep.tools.find(t => t.tool === data?.tool && t.status === 'running');
+        if (!tool) {
+          // 容错：直接 push 一个完成的
+          tool = {
+            tool: data?.tool || 'unknown',
+            status: 'done',
+            summary: data?.summary || '',
+            durationMs: data?.durationMs || 0,
+            resultCount: data?.resultCount || 0,
+            results: data?.results || null,
+          };
+          currentStep.tools.push(tool);
+        } else {
+          tool.status = data?.success === false ? 'error' : 'done';
+          tool.summary = data?.summary || '';
+          tool.durationMs = data?.durationMs || 0;
+          tool.resultCount = data?.resultCount || 0;
+          tool.error = data?.error || null;
+          // 保存搜索结果（[{title,url}]），用于折叠栏内渲染超链接
+          tool.results = data?.results || null;
+        }
+        // 工具全部完成后标记步骤为 done
+        if (currentStep.tools.length > 0 && currentStep.tools.every(t => t.status !== 'running')) {
+          currentStep.status = 'done';
+        }
+        sseStats.searchPieces += 1;
+       } else if (type === 'search_results') {
+        // 兼容旧协议：search_results 仍然更新 searchResults 字段（用于搜索链接列表渲染）
+        // 但优先使用 tool_call_result 中的数据（thinkingSteps），此字段仅作 fallback
+        botMsg().searchResults = JSON.stringify(data);
+        sseStats.searchPieces += 1;
+       } else if (type === 'search_start') {
+        // 兼容旧协议（快速模式旧版）：保留 searchStatus 字段用于渲染
+        botMsg().searchStatus = {
+          status: 'searching',
+          keywords: data?.keywords || []
+        };
+        botMsg().isThinking = false;
+        botMsg().thinking = '';
+       } else if (type === 'search_summary') {
+        // 兼容旧协议
+        botMsg().searchStatus = {
+          status: 'completed',
+          keywords: data?.keywords || [],
+          count: data?.count || 0,
+          duration: data?.duration || 0
+        };
+        if (data?.results) {
+          botMsg().searchResults = JSON.stringify(data.results);
+        }
+        sseStats.searchPieces += 1;
+       } else if (type === 'thinking_start') {
+        // 深度思考开始：标记思考状态，reasoning 将写入独立字段
+        botMsg().isThinking = true;
+        botMsg().deepThinkingReasoning = '';
+        if (botMsg().searchStatus?.status === 'searching') {
+          botMsg().searchStatus = null;
+        }
+       } else if (type === 'thinking') {
+        // 深度思考推理链（流式）：累加到消息级独立字段，不再写入步骤
+        botMsg().isThinking = true;
+        botMsg().deepThinkingReasoning += (data || '');
+        sseStats.thinkingPieces += 1;
+      } else if (type === 'thinking_error') {
+        // 思考错误
+        botMsg().isThinking = false;
+        botMsg().deepThinkingReasoning += `\n[思考错误] ${data?.error || '未知错误'}`;
+       }
+       return;
+     } catch (e) {
+       // JSON 解析失败兜底按纯文本写入（非空行，不再打印解析失败原因到 console，避免刷屏）
+       botMsg().content += line;
+       return;
+     }
+   }
+   // 非 JSON 纯文本行（一般是旧模型的"错误: xxx"这类降级响应）
+   botMsg().content += line;
+ };
  try {
  while (true) {
  const { done, value } = await reader.read();
- if (done)
- break;
+ if (done) break;
  lineBuffer += decoder.decode(value, { stream: true });
  let newlineIdx;
  while ((newlineIdx = lineBuffer.indexOf('\n')) >= 0) {
- const line = lineBuffer.substring(0, newlineIdx).trim();
- lineBuffer = lineBuffer.substring(newlineIdx + 1);
- if (!line)
- continue;
- if (line.startsWith('{')) {
- try {
- const jsonChunk = JSON.parse(line);
- if (jsonChunk.type === 'content') {
- // 正式回复内容，清除思考状态
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].content += jsonChunk.data;
- }
- else if (jsonChunk.type === 'search_results') {
- messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data);
- }
- else if (jsonChunk.type === 'search_start') {
- // 搜索开始状态 - 清除思考状态（互斥）
- messages.value[botMessageIndex].searchStatus = {
- status: 'searching',
- keywords: jsonChunk.data?.keywords || []
- };
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].thinking = '';
- }
- else if (jsonChunk.type === 'search_summary') {
- // 搜索摘要（包含搜索结果）
- messages.value[botMessageIndex].searchStatus = {
- status: 'completed',
- keywords: jsonChunk.data?.keywords || [],
- count: jsonChunk.data?.count || 0,
- duration: jsonChunk.data?.duration || 0
- };
- // 同时保存搜索结果
- if (jsonChunk.data?.results) {
- messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data.results);
+   const line = lineBuffer.substring(0, newlineIdx).trim();
+   lineBuffer = lineBuffer.substring(newlineIdx + 1);
+   applyChunkLine(line);
+   scrollToBottom();
  }
  }
- else if (jsonChunk.type === 'thinking_start') {
- // 深度思考开始状态 - 清除搜索状态（互斥）
- messages.value[botMessageIndex].isThinking = true;
- messages.value[botMessageIndex].thinking = '';
- // 如果正在搜索中，清除搜索状态
- if (messages.value[botMessageIndex].searchStatus?.status === 'searching') {
- messages.value[botMessageIndex].searchStatus = null;
- }
- }
- else if (jsonChunk.type === 'thinking') {
- // 思考过程（流式）
- messages.value[botMessageIndex].isThinking = true;
- messages.value[botMessageIndex].thinking += jsonChunk.data;
- }
- else if (jsonChunk.type === 'thinking_error') {
- // 思考错误
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].thinking += `\n[思考错误] ${jsonChunk.data?.error || '未知错误'}`;
- }
- }
- catch (e) {
- messages.value[botMessageIndex].content += line;
- }
- }
- else {
- messages.value[botMessageIndex].content += line;
- }
- scrollToBottom();
- }
- }
+ // 最后残留无换行的半行（也走同一个 apply，避免重复 if-else）
  const remaining = lineBuffer.trim();
- if (remaining) {
- if (remaining.startsWith('{')) {
- try {
- const jsonChunk = JSON.parse(remaining);
- if (jsonChunk.type === 'content') {
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].content += jsonChunk.data;
- }
- else if (jsonChunk.type === 'search_results') {
- messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data);
- }
- else if (jsonChunk.type === 'search_start') {
- messages.value[botMessageIndex].searchStatus = {
- status: 'searching',
- keywords: jsonChunk.data?.keywords || []
- };
- }
- else if (jsonChunk.type === 'search_summary') {
- messages.value[botMessageIndex].searchStatus = {
- status: 'completed',
- keywords: jsonChunk.data?.keywords || [],
- count: jsonChunk.data?.count || 0,
- duration: jsonChunk.data?.duration || 0
- };
- if (jsonChunk.data?.results) {
- messages.value[botMessageIndex].searchResults = JSON.stringify(jsonChunk.data.results);
- }
- }
- else if (jsonChunk.type === 'thinking_start') {
- messages.value[botMessageIndex].isThinking = true;
- messages.value[botMessageIndex].thinking = '';
- }
- else if (jsonChunk.type === 'thinking') {
- messages.value[botMessageIndex].isThinking = true;
- messages.value[botMessageIndex].thinking += jsonChunk.data;
- }
- else if (jsonChunk.type === 'thinking_error') {
- messages.value[botMessageIndex].isThinking = false;
- messages.value[botMessageIndex].thinking += `\n[思考错误] ${jsonChunk.data?.error || '未知错误'}`;
- }
- }
- catch (e) {
- messages.value[botMessageIndex].content += remaining;
- }
- }
- else {
- messages.value[botMessageIndex].content += remaining;
- }
- }
+ if (remaining) applyChunkLine(remaining);
  } finally {
  reader.releaseLock();
+ // 流结束：统一清除 isThinking spinner（之前 content 到来不清，避免思考栏过早隐藏）
+ // 注意：thinking 文本保留，思考栏仍会显示，只是停止转圈动画
+ if (botMsg()) {
+   botMsg().isThinking = false;
+ }
+ // 【STREAM DONE 诊断】统一一条 F12 可见证据：后端日志 [SSE完成] + 前端 sseStats 能对得上
+ console.debug('[STREAM DONE]', {
+   lines: sseStats.lines,
+   jsonLines: sseStats.jsonLines,
+   contentPieces: sseStats.contentPieces,
+   thinkingPieces: sseStats.thinkingPieces,
+   searchPieces: sseStats.searchPieces,
+   contentLen: (botMsg()?.content || '').length,
+   thinkingLen: (botMsg()?.thinking || '').length,
+   isThinking: botMsg()?.isThinking,
+   searchLen: (botMsg()?.searchResults || '').length,
+ });
  }
  }
  catch (error) {
@@ -863,50 +1039,115 @@ const processAudio = async (audioBlob) => {
                   </div>
                 </div>
                 
-                <!-- 正在思考时显示思考过程（优先级高于搜索完成状态） -->
-                <div v-else-if="msg.isThinking && !msg.content" class="thinking-container">
-                  <div class="thinking-header">
-                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" :class="{ 'thinking-spinner': msg.isThinking }">
-                      <circle cx="12" cy="12" r="10"/>
-                      <path d="M12 6v6l4 2"/>
+                <!-- 工具调用结果面板（折叠栏，默认折叠） -->
+                <div v-if="msg.thinkingSteps && msg.thinkingSteps.length > 0" class="collapsible-panel tools-panel">
+                  <div class="collapsible-header" @click="toggleThinkingSteps(index)">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
                     </svg>
-                    <span>思考中...</span>
+                    <span class="collapsible-title">
+                      工具调用结果
+                      · 共 {{ msg.thinkingSteps.length }} 步
+                      <template v-if="msg.thinkingStartTime && !msg.isThinking">
+                        · 耗时 {{ ((Date.now() - msg.thinkingStartTime) / 1000).toFixed(1) }}s
+                      </template>
+                    </span>
+                    <svg :class="['collapsible-chevron', { 'collapsed': !expandedSteps[index] }]" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="9 18 15 12 9 6"/>
+                    </svg>
                   </div>
-                  <div class="thinking-content">{{ msg.thinking }}</div>
+                  <div v-if="expandedSteps[index]" class="collapsible-body">
+                    <!-- 步骤列表 -->
+                    <div v-for="(step, stepIdx) in msg.thinkingSteps" :key="stepIdx" class="thinking-step">
+                      <!-- 步骤编号和分析文本 -->
+                      <div class="thinking-step-header">
+                        <span class="thinking-step-num">{{ stepIdx + 1 }}</span>
+                        <div class="thinking-step-content">
+                          <div class="thinking-step-analysis">{{ step.analysis }}</div>
+                          <div v-if="step.purpose" class="thinking-step-purpose">目的：{{ step.purpose }}</div>
+                        </div>
+                      </div>
+                      <!-- 工具调用摘要 + 搜索结果（每步可多个工具，每个工具是小折叠栏） -->
+                      <div v-if="step.tools && step.tools.length > 0" class="thinking-step-tools">
+                        <div v-for="(tool, toolIdx) in step.tools" :key="toolIdx" class="tool-collapsible">
+                          <!-- 小折叠栏头部：工具摘要（可点击展开/收起搜索结果） -->
+                          <div class="tool-summary" :class="{ 'tool-running': tool.status === 'running', 'tool-error': tool.status === 'error' }"
+                               :style="{ cursor: (tool.results || tool.rawResult) ? 'pointer' : 'default' }"
+                               @click="(tool.results || tool.rawResult) && toggleTools(index, stepIdx, toolIdx)">
+                            <template v-if="tool.tool === 'web_search'">
+                              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                              </svg>
+                              <span>
+                                <template v-if="tool.status === 'running'">正在搜索...</template>
+                                <template v-else>{{ tool.summary || `已搜索 ${tool.resultCount} 个网页` }}</template>
+                                <template v-if="tool.durationMs"> · {{ (tool.durationMs / 1000).toFixed(1) }}s</template>
+                              </span>
+                            </template>
+                            <template v-else-if="tool.tool === 'memory_search'">
+                              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+                              </svg>
+                              <span>
+                                <template v-if="tool.status === 'running'">正在检索记忆...</template>
+                                <template v-else>{{ tool.summary || `已读取 ${tool.resultCount} 个记忆片段` }}</template>
+                                <template v-if="tool.durationMs"> · {{ (tool.durationMs / 1000).toFixed(1) }}s</template>
+                              </span>
+                            </template>
+                            <template v-else>
+                              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                              </svg>
+                              <span>
+                                {{ tool.summary || tool.tool }}
+                                <template v-if="tool.durationMs"> · {{ (tool.durationMs / 1000).toFixed(1) }}s</template>
+                              </span>
+                            </template>
+                            <!-- 有搜索结果时显示展开/收起箭头 -->
+                            <svg v-if="(tool.results || tool.rawResult) && (tool.results || tool.rawResult).length > 0"
+                                 :class="['tool-chevron', { 'collapsed': !expandedTools[`${index}-${stepIdx}-${toolIdx}`] }]"
+                                 viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
+                              <polyline points="9 18 15 12 9 6"/>
+                            </svg>
+                          </div>
+                          <!-- 搜索结果超链接列表（小折叠栏内容，默认折叠） -->
+                          <div v-if="(tool.results || tool.rawResult) && (tool.results || tool.rawResult).length > 0 && expandedTools[`${index}-${stepIdx}-${toolIdx}`]"
+                               class="search-links-list">
+                            <a v-for="(result, rIdx) in (tool.results || tool.rawResult)" :key="rIdx"
+                               :href="result.url" target="_blank" rel="noopener noreferrer"
+                               class="search-link-item">
+                              <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M7 17l9.2-9.2M8.7 7.4h7.9v7.9"/>
+                              </svg>
+                              <span>{{ result.title || result.url }}</span>
+                            </a>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 深度思考推理链面板（折叠栏，默认折叠） -->
+                <div v-if="msg.deepThinkingReasoning && msg.deepThinkingReasoning.length > 0" class="collapsible-panel reasoning-panel">
+                  <div class="collapsible-header" @click="toggleReasoning(index)">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" :class="{ 'thinking-spinner': msg.isThinking }">
+                      <path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.3A7 7 0 0 0 12 2z"/>
+                    </svg>
+                    <span class="collapsible-title">
+                      {{ msg.isThinking ? '深度思考中...' : '深度思考过程' }}
+                    </span>
+                    <svg :class="['collapsible-chevron', { 'collapsed': !expandedReasoning[index] }]" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="9 18 15 12 9 6"/>
+                    </svg>
+                  </div>
+                  <div v-if="expandedReasoning[index]" class="collapsible-body">
+                    <div class="reasoning-content">{{ msg.deepThinkingReasoning }}</div>
+                  </div>
                 </div>
                 
                 <!-- 正式回复内容 -->
                 <span v-if="msg.content" class="message-text" v-html="renderMarkdown(msg.content)"></span>
-                
-                <!-- 搜索结果折叠面板 -->
-                <div v-if="msg.searchResults && getSearchResults(msg.searchResults).length > 0" class="search-container">
-                  <button class="search-toggle" @click="toggleSearch(index)">
-                    <svg v-if="!expandedSearch[index]" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-                      <circle cx="11" cy="11" r="8"/>
-                      <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                    </svg>
-                    <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-                      <line x1="18" y1="6" x2="6" y2="18"/>
-                      <line x1="6" y1="6" x2="18" y2="18"/>
-                    </svg>
-                    <span>{{ expandedSearch[index] ? '收起搜索结果' : '查看搜索结果' }}</span>
-                  </button>
-                  <div v-if="expandedSearch[index]" class="search-content-box">
-                    <span class="search-label">【搜索结果】</span>
-                    <div class="search-list">
-                      <a v-for="(result, idx) in getSearchResults(msg.searchResults)" :key="idx" :href="result.url" target="_blank" class="search-item">
-                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-                          <polyline points="16 18 22 12 16 6"/>
-                          <line x1="22" y1="12" x2="10" y2="12"/>
-                        </svg>
-                        <div class="search-item-content">
-                          <span class="search-item-title">{{ result.title }}</span>
-                          <span class="search-item-url">{{ result.url }}</span>
-                        </div>
-                      </a>
-                    </div>
-                  </div>
-                </div>
               </template>
             </div>
           </div>
@@ -1384,113 +1625,205 @@ const processAudio = async (audioBlob) => {
 .search-spinner {
   animation: spin 1s linear infinite;
 }
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
 
-/* 思考过程样式 */
-.thinking-container {
+/* 折叠面板通用样式（工具调用结果 + 深度思考过程共用） */
+.collapsible-panel {
   margin-top: 12px;
-  padding: 12px 14px;
-  background: #fef3c7;
-  border-radius: 8px;
-  border-left: 3px solid #f59e0b;
+  border-radius: 10px;
+  overflow: hidden;
 }
-.thinking-header {
+.collapsible-header {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  color: #d97706;
-  font-size: 13px;
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-.thinking-spinner {
-  animation: spin 1s linear infinite;
-}
-.thinking-content {
-  color: #92400e;
-  font-size: 14px;
-  line-height: 1.6;
-  white-space: pre-wrap;
-}
-
-.search-container {
-  margin-top: 12px;
-}
-.search-toggle {
-  display: inline-flex;
   align-items: center;
   gap: 8px;
   padding: 8px 14px;
-  background: #f1f5f9;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
   cursor: pointer;
+  user-select: none;
   font-size: 13px;
-  color: #64748b;
-  transition: all 0.2s;
-}
-.search-toggle:hover {
-  background: #e2e8f0;
-  color: #334155;
-}
-.search-content-box {
-  margin-top: 8px;
-  padding: 14px;
-  background-color: #f8fafc;
-  border-radius: 10px;
-  border: 1px solid #e2e8f0;
-  animation: fadeIn 0.2s;
-}
-.search-label { 
-  color: #64748b; 
-  font-weight: 600; 
-  display: block; 
-  margin-bottom: 10px; 
-  font-size: 12px;
-}
-.search-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.search-item {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 12px 14px;
-  background: white;
-  border-radius: 8px;
-  text-decoration: none;
-  color: #3b82f6;
-  font-size: 14px;
-  transition: all 0.2s;
-  border: 1px solid #e2e8f0;
-}
-.search-item:hover {
-  background: #dbeafe;
-  border-color: #3b82f6;
-  transform: translateX(4px);
-}
-.search-item-content {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.search-item-title {
   font-weight: 600;
-  color: #1e40af;
-  font-size: 14px;
+  transition: background 0.15s;
 }
-.search-item-url {
+.collapsible-title {
+  flex: 1;
+}
+.collapsible-chevron {
+  transition: transform 0.2s;
+}
+.collapsible-chevron.collapsed {
+  transform: rotate(-90deg);
+}
+.collapsible-body {
+  padding: 0 14px 12px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  padding-top: 10px;
+}
+
+/* 工具调用结果面板：蓝色系 */
+.tools-panel {
+  background: #eff6ff;
+  border-left: 3px solid #3b82f6;
+}
+.tools-panel .collapsible-header {
+  color: #2563eb;
+}
+.tools-panel .collapsible-header:hover {
+  background: rgba(59, 130, 246, 0.08);
+}
+.tools-panel .collapsible-body {
+  border-top-color: rgba(59, 130, 246, 0.2);
+}
+
+/* 深度思考面板：琥珀色系 */
+.reasoning-panel {
+  background: #fef3c7;
+  border-left: 3px solid #f59e0b;
+}
+.reasoning-panel .collapsible-header {
+  color: #d97706;
+}
+.reasoning-panel .collapsible-header:hover {
+  background: rgba(245, 158, 11, 0.08);
+}
+.reasoning-panel .collapsible-body {
+  border-top-color: rgba(245, 158, 11, 0.2);
+}
+
+.thinking-spinner {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 步骤列表样式 */
+.thinking-step {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: #f0f7ff;
+  border-radius: 8px;
+  border: 1px solid rgba(59, 130, 246, 0.12);
+}
+.thinking-step:last-child {
+  margin-bottom: 0;
+}
+.thinking-step-header {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.thinking-step-num {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #3b82f6;
+  color: white;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 600;
+}
+.thinking-step-content {
+  flex: 1;
+  min-width: 0;
+}
+.thinking-step-analysis {
+  color: #1e3a5f;
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.thinking-step-purpose {
+  margin-top: 4px;
+  color: #64748b;
+  font-size: 12px;
+  font-style: italic;
+}
+.thinking-step-tools {
+  margin-top: 8px;
+  padding-left: 32px;
+}
+.tool-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 12px;
   color: #64748b;
+  margin-right: 14px;
+  margin-bottom: 4px;
+}
+.tool-summary svg {
+  opacity: 0.7;
+}
+.tool-summary.tool-running {
+  color: #3b82f6;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+.tool-summary.tool-error {
+  color: #ef4444;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+/* 工具项容器（小折叠栏） */
+.tool-collapsible {
+  margin-bottom: 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.5);
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+.tool-collapsible .tool-summary {
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+.tool-collapsible .tool-summary:hover {
+  background: rgba(59, 130, 246, 0.06);
+}
+/* 小折叠栏箭头 */
+.tool-chevron {
+  transition: transform 0.2s;
+  margin-left: auto;
+}
+.tool-chevron.collapsed {
+  transform: rotate(-90deg);
+}
+/* 搜索结果超链接列表 */
+.search-links-list {
+  margin-top: 4px;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.search-link-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #2563eb;
+  text-decoration: none;
+  line-height: 1.4;
+  word-break: break-all;
+  transition: color 0.15s;
+}
+.search-link-item:hover {
+  color: #1d4ed8;
+  text-decoration: underline;
+}
+.search-link-item svg {
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+.reasoning-content {
+  color: #78350f;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .chat-input-area {
