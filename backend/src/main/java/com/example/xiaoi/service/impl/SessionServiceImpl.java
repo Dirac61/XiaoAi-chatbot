@@ -215,6 +215,31 @@ public class SessionServiceImpl implements SessionService {
     }
 
     /**
+     * 仅保存占位消息到 Redis（不写 MySQL）。
+     * 用于 SSE 流开始前预存 assistant 消息，确保 Agent 的 expertTrace 回写能按 UUID 扫到。
+     * 不触发 asyncSaveMessageToDb，避免和用户消息的 MySQL INSERT 竞态导致顺序错乱。
+     */
+    @Override
+    public void savePlaceholderToRedis(Long sessionId, Map<String, Object> message) {
+        try {
+            if (!message.containsKey("messageUuid")) {
+                message.put("messageUuid", java.util.UUID.randomUUID().toString());
+            }
+            String messageJson = objectMapper.writeValueAsString(message);
+            String redisKey = REDIS_KEY_PREFIX + sessionId;
+            redisTemplate.opsForList().rightPush(redisKey, messageJson);
+            Long size = redisTemplate.opsForList().size(redisKey);
+            if (size != null && size > MAX_REDIS_MESSAGES) {
+                redisTemplate.opsForList().trim(redisKey, size - MAX_REDIS_MESSAGES, -1);
+            }
+            redisTemplate.expire(redisKey, REDIS_EXPIRE_DAYS, TimeUnit.DAYS);
+            logger.debug("[占位消息] 已写入 Redis（跳过 MySQL）: sessionId={}, messageUuid={}", sessionId, message.get("messageUuid"));
+        } catch (JsonProcessingException e) {
+            logger.error("占位消息序列化失败: sessionId={}, 错误={}", sessionId, e.getMessage());
+        }
+    }
+
+    /**
      * 递增对话轮次并判断是否触发摘要提取
      * 轮次计数通过 Redis 同步递增（毫秒级），摘要提取通过异步服务执行
      */
@@ -356,14 +381,14 @@ public class SessionServiceImpl implements SessionService {
             return;
         }
         // 【消息覆盖防御】根据本次要更新的字段决定"只能命中 role=xxx"：
-        //   - hasMsg || hasExt → 用户侧字段，必须命中 role=user；
-        //   - hasExp → 专家模式跟踪，必须命中 role=assistant；
-        //   - hasUserFields 和 hasAssistantFields 同时 true → 非法调用（一次调用不能同时更新 user+assistant 两种不同字段），直接 ERROR 返回，
-        //     不扫描不覆盖，防止"用户消息被写 expertTrace"或"assistant 消息被覆盖正文"等你反馈的错乱。
-        boolean hasUserFields = hasMsg || hasExt;
-        boolean hasAssistantFields = hasExp;
-        if (hasUserFields && hasAssistantFields) {
-            logger.error("多字段回写字段组合非法：一次调用同时包含 user侧字段(message/extractedText) 和 assistant侧字段(expertTrace)，" +
+        //   - extractedText → 用户侧独有字段，必须命中 role=user；
+        //   - expertTrace → assistant 侧独有字段，必须命中 role=assistant；
+        //   - message → 通用字段（user 正文 / assistant 回复），不限制 role；
+        //   - extractedText 和 expertTrace 同时 true → 非法调用，直接 ERROR 返回。
+        boolean hasUserOnlyFields = hasExt;
+        boolean hasAssistantOnlyFields = hasExp;
+        if (hasUserOnlyFields && hasAssistantOnlyFields) {
+            logger.error("多字段回写字段组合非法：一次调用同时包含 user侧字段(extractedText) 和 assistant侧字段(expertTrace)，" +
                     "跳过以避免覆盖错位: sessionId={}, messageUuid={}", sessionId, messageUuid);
             return;
         }
@@ -383,17 +408,16 @@ public class SessionServiceImpl implements SessionService {
                         logger.debug("检查消息[{}]: messageUuid={}", i, uuid);
                         if (messageUuid.equals(uuid)) {
                             // 【role 校验】防止 UUID 对到错误的消息：
-                            //  找到的 msg.role 必须与本次更新语义匹配，否则 ERROR 不覆盖。
-                            //  - user侧字段更新 -> role 必须是 "user"；
-                            //  - assistant侧字段更新 -> role 必须是 "assistant"；
-                            //  若都没有（理论上不会，hasUserFields/hasAssistantFields 同时为假已在上文 return），则放行。
+                            //  - extractedText 更新 -> role 必须是 "user"；
+                            //  - expertTrace 更新 -> role 必须是 "assistant"；
+                            //  - message 更新 -> 不限制 role（user 正文 / assistant 回复都可以更新）。
                             String role = (String) msg.get("role");
-                            if (hasUserFields && !"user".equals(role)) {
-                                logger.error("按 UUID 命中的消息 role 非法（更新 user 侧字段但 role={}），拒绝覆盖: " +
+                            if (hasUserOnlyFields && !"user".equals(role)) {
+                                logger.error("按 UUID 命中的消息 role 非法（更新 extractedText 但 role={}），拒绝覆盖: " +
                                         "sessionId={}, messageUuid={}, index={}", role, sessionId, messageUuid, i);
                                 break;
                             }
-                            if (hasAssistantFields && !"assistant".equals(role)) {
+                            if (hasAssistantOnlyFields && !"assistant".equals(role)) {
                                 logger.error("按 UUID 命中的消息 role 非法（更新 assistant 侧字段但 role={}），拒绝覆盖: " +
                                         "sessionId={}, messageUuid={}, index={}", role, sessionId, messageUuid, i);
                                 break;

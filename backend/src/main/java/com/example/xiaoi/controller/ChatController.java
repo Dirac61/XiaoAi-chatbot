@@ -149,7 +149,6 @@ public class ChatController {
 
         return outputStream -> {
             StringBuilder responseBuilder = new StringBuilder();
-            StringBuilder searchResultsBuilder = new StringBuilder();
             StringBuilder lineBuffer = new StringBuilder();
             CountDownLatch latch = new CountDownLatch(1);
             Disposable disposable = null;
@@ -157,6 +156,10 @@ public class ChatController {
             java.util.concurrent.atomic.AtomicReference<String> sseSummary = new java.util.concurrent.atomic.AtomicReference<>("");
             // 超时标志：try 内 latch.await 赋值，try 外 [聊天完成] 汇总使用
             final java.util.concurrent.atomic.AtomicBoolean timedOut = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+            // SSE 流中捕获 expert_trace 事件（Agent 在流末尾发送，含工具调用链和编排分析）
+            // 和原来的 search_results 捕获逻辑一样：流中累积，流结束随 saveMessage 一起持久化
+            final StringBuilder expertTraceBuilder = new StringBuilder();
 
             try {
                 String jsonBody = objectMapper.writeValueAsString(requestBody);
@@ -166,7 +169,6 @@ public class ChatController {
                 AtomicInteger jsonLines = new AtomicInteger(0);
                 AtomicInteger plainLines = new AtomicInteger(0);
                 AtomicInteger contentLines = new AtomicInteger(0);
-                AtomicInteger searchLines = new AtomicInteger(0);
                 AtomicLong contentChars = new AtomicLong(0);
                 final long agentStartNs = System.nanoTime();
 
@@ -219,14 +221,16 @@ public class ChatController {
                                                     contentChars.addAndGet(content.length());
                                                     responseBuilder.append(content);
                                                 }
-                                            } else if ("search_results".equals(type)) {
-                                                searchLines.incrementAndGet();
-                                                Object data = jsonChunk.get("data");
-                                                String searchResults = objectMapper.writeValueAsString(data);
-                                                searchResultsBuilder.append(searchResults);
-                                                // 【降噪】搜索结果只打 DEBUG，保留长度；结束时会打汇总 INFO
-                                                logger.debug("[搜索] 提取分段 sessionId={} len={}", sessionId, searchResults.length());
+                                            } else if ("expert_trace".equals(type)) {
+                                                // 捕获 expert_trace 事件（Agent 在流末尾发送工具调用链+编排分析）
+                                                // 流结束时随 saveMessage 一起持久化，无需 HTTP 回调避免竞态
+                                                String traceData = (String) jsonChunk.get("data");
+                                                if (traceData != null) {
+                                                    expertTraceBuilder.append(traceData);
+                                                }
                                             }
+                                            // 其它所有 JSON 类型（orchestration_step/tool_call_start/tool_call_result/thinking 等）
+                                            // 均直接透传给前端，不做额外处理
                                         } catch (Exception e) {
                                             logger.debug("[Agent] 解析JSON line失败按普通内容 sessionId={} err={}", sessionId, e.getMessage());
                                             responseBuilder.append(line);
@@ -267,12 +271,8 @@ public class ChatController {
                                             contentChars.addAndGet(content.length());
                                             responseBuilder.append(content);
                                         }
-                                    } else if ("search_results".equals(type)) {
-                                        searchLines.incrementAndGet();
-                                        Object data = jsonChunk.get("data");
-                                        String searchResults = objectMapper.writeValueAsString(data);
-                                        searchResultsBuilder.append(searchResults);
                                     }
+                                    // 注意：search_results 不再累积（同上）
                                 } catch (Exception e) {
                                     logger.debug("[Agent] 解析剩余JSON失败 sessionId={} err={}", sessionId, e.getMessage());
                                     responseBuilder.append(remaining);
@@ -295,9 +295,9 @@ public class ChatController {
                         double ms = (System.nanoTime() - agentStartNs) / 1_000_000.0;
                         sseSummary.set(
                             String.format(
-                                "rawChunks=%d jsonLines=%d plainLines=%d contentLines=%d searchLines=%d bufferRemaining=%d sseMs=%.1f",
+                                "rawChunks=%d jsonLines=%d plainLines=%d contentLines=%d bufferRemaining=%d sseMs=%.1f",
                                 chunkCount.get(), jsonLines.get(), plainLines.get(),
-                                contentLines.get(), searchLines.get(),
+                                contentLines.get(),
                                 (lineBuffer != null ? lineBuffer.length() : 0), ms
                             )
                         );
@@ -329,6 +329,8 @@ public class ChatController {
             }
 
             if (responseBuilder.length() > 0) {
+                // 恢复原始流程：流结束后 saveMessage(assistant) 到 Redis + MySQL
+                // 顺序保证：user 在 L132 已先 rightPush，这里 assistant 后 rightPush → Redis 顺序正确
                 Map<String, Object> assistantMessage = new HashMap<>();
                 assistantMessage.put("role", "assistant");
                 assistantMessage.put("content", responseBuilder.toString());
@@ -337,23 +339,25 @@ public class ChatController {
                 assistantMessage.put("timestamp", System.currentTimeMillis());
                 assistantMessage.put("messageUuid", assistantMessageUuid);
 
-                int searchLen = 0;
-                if (searchResultsBuilder.length() > 0) {
-                    String searchResults = searchResultsBuilder.toString();
-                    assistantMessage.put("searchResults", searchResults);
-                    searchLen = searchResults.length();
+                // 如果 SSE 流中捕获到 expert_trace，解析后放入 assistant 消息
+                if (expertTraceBuilder.length() > 0) {
+                    try {
+                        Object traceObj = objectMapper.readValue(expertTraceBuilder.toString(), Object.class);
+                        assistantMessage.put("expertTrace", traceObj);
+                    } catch (Exception e) {
+                        logger.warn("[expert_trace] 解析失败，降级为字符串保存: {}", e.getMessage());
+                        assistantMessage.put("expertTrace", expertTraceBuilder.toString());
+                    }
                 }
-                // 【关键时序】先 saveMessage，确保 Redis/DB 里 assistant 消息已经存在。
-                // 否则 Agent 的 update_backend_expert_trace（asyncio.create_task 触发）可能比这里 saveMessage 更早执行，
-                // 导致按 assistantMessageUuid 在 Redis 里 scan 不到 → 匹配到同 session 里的其它消息（可能是 user 消息）。
+
                 sessionService.saveMessage(sessionId, assistantMessage, "TEXT", null);
 
                 // 【只保留 1 条汇总 INFO】合并：请求概览 + SSE细节 + 最终结果
                 // 同时打印 userUuid/assistantUuid，便于和 Agent 回写日志对齐
                 logger.info(
-                        "[聊天完成] sessionId={} userUuid={} assistantUuid={} replyLen={} searchLen={} timeout={} {}",
+                        "[聊天完成] sessionId={} userUuid={} assistantUuid={} replyLen={} timeout={} {}",
                         sessionId, userMessageUuid, assistantMessageUuid,
-                        responseBuilder.length(), searchLen,
+                        responseBuilder.length(),
                         timedOut.get() ? "Y" : "N",
                         (sseSummary.get() != null && !sseSummary.get().isEmpty() ? sseSummary.get() : "sse=<none>")
                 );

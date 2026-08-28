@@ -215,7 +215,16 @@ public class SessionAsyncService {
                     }
                 }
                 if (!found) {
-                    logger.warn("未找到匹配的消息记录: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                    // 占位消息只在 Redis 有、MySQL 没有对应行 → 自动 INSERT（upsert 语义）
+                    logger.info("[MySQL upsert] 未找到匹配记录，自动插入: sessionId={}, messageUuid={}", sessionId, messageUuid);
+                    SessionDetail newDetail = new SessionDetail();
+                    newDetail.setSessionId(sessionId);
+                    newDetail.setMessages(updatedJson);
+                    newDetail.setMessageType("TEXT");
+                    newDetail.setMediaUrl(null);
+                    newDetail.setCreatedAt(LocalDateTime.now());
+                    newDetail.setUpdatedAt(LocalDateTime.now());
+                    sessionDetailMapper.insert(newDetail);
                 }
             } else {
                 logger.warn("会话不存在或无消息: sessionId={}", sessionId);

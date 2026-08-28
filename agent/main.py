@@ -15,7 +15,7 @@ import secrets
 import contextvars
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Tuple, AsyncIterator, Callable, Awaitable
+from typing import List, Optional, Dict, Any, Tuple, AsyncIterator, AsyncGenerator, Callable, Awaitable
 
 # ---- correlation_id：每条请求分配一个短ID，所有日志自动带 [req-XXXX] 前缀 ----
 # 解决：多并发对话时日志糊在一起，分不清哪条请求的流水
@@ -318,9 +318,11 @@ class ExpertState:
     # 持久化数据：编排历史（analysis）+ 工具执行历史（原始结果不摘要）
     orch_history: List[OrchHistoryRecord] = field(default_factory=list)
 
-    # FINAL 阶段流式结果（正文）
+    # FINAL 阶段流式结果（正文 + 深度思考reasoning）
     final_path: Optional[str] = None   # deep_thinking / reply_directly
     assistant_response: str = ""
+    # 深度思考推理链全文（用户要求持久化到 expertTrace，与工具调用结果同等对待）
+    deep_thinking_reasoning: str = ""
 
 
 # ==============================================================================
@@ -353,10 +355,11 @@ async def _tool_web_search(params: Dict[str, Any], state: ExpertState) -> Tuple[
         logger.warning("[专家模式][工具:web_search] keywords 为空，跳过")
     else:
         try:
-            # 立即向前端发送 search_start 状态
-            stream_chunks.append(
-                json.dumps({"type": "search_start", "data": {"keywords": keywords}}, ensure_ascii=False)
-            )
+            # 立即向前端发送 tool_call_start 状态（统一工具调用协议）
+            stream_chunks.append(json.dumps({
+                "type": "tool_call_start",
+                "data": {"tool": "web_search", "params": {"keywords": keywords}},
+            }, ensure_ascii=False))
             # 单工具启动降到 DEBUG：每次专家迭代如果有工具调用就会打 2 条（开始+完成），
             # 汇总交给 _expert_execute_step 的 [EXECUTING] 完成行，避免日志与 summary 行重复
             logger.debug("[专家模式][工具:web_search] 开始搜索 keywords=%s", keywords)
@@ -383,19 +386,33 @@ async def _tool_web_search(params: Dict[str, Any], state: ExpertState) -> Tuple[
             # 打 1 条汇总行（包含所有工具名+各自结果计数），单工具不必再 INFO 刷屏
             logger.debug("[专家模式][工具:web_search] 完成 count=%s, 耗时=%.2fs", result_count, duration_s)
 
-            # search_summary 流式块
+            # tool_call_result 流式块（统一工具调用协议，前端据此渲染工具摘要行）
             stream_chunks.append(json.dumps({
-                "type": "search_summary",
+                "type": "tool_call_result",
                 "data": {
-                    "keywords": keywords,
+                    "tool": "web_search",
+                    "success": True,
+                    "durationMs": int(duration_s * 1000),
+                    "resultCount": result_count,
+                    "summary": f"已搜索 {result_count} 个网页",
                     "results": raw_result,
-                    "count": result_count,
-                    "duration": round(duration_s, 2),
                 },
             }, ensure_ascii=False))
         except Exception as e:
             error = f"{type(e).__name__}: {str(e)}"
             logger.error(f"[专家模式][工具:web_search] 失败: {error}")
+            # 异常时也发 tool_call_result，前端能感知失败
+            stream_chunks.append(json.dumps({
+                "type": "tool_call_result",
+                "data": {
+                    "tool": "web_search",
+                    "success": False,
+                    "durationMs": 0,
+                    "resultCount": 0,
+                    "summary": "搜索失败",
+                    "error": error,
+                },
+            }, ensure_ascii=False))
 
     duration_ms = int((time.time() - start) * 1000)
     record = ToolExecutionRecord(
@@ -419,6 +436,12 @@ async def _tool_memory_search(params: Dict[str, Any], state: ExpertState) -> Tup
     result_count = 0
     raw_result: List[str] = []
 
+    # ===== 新增：tool_call_start 通知（统一工具调用协议，前端显示工具正在运行）=====
+    stream_chunks.append(json.dumps({
+        "type": "tool_call_start",
+        "data": {"tool": "memory_search", "params": {"query": query[:50]}},
+    }, ensure_ascii=False))
+
     try:
         # memory_search 启动：静默工具（不向前端发 SSE），每次只打 DEBUG 避免 INFO 堆
         logger.debug("[专家模式][工具:memory_search] query=%s...", (query[:50] if query else ""))
@@ -437,6 +460,20 @@ async def _tool_memory_search(params: Dict[str, Any], state: ExpertState) -> Tup
         logger.error(f"[专家模式][工具:memory_search] 失败: {error}")
 
     duration_ms = int((time.time() - start) * 1000)
+
+    # ===== 新增：tool_call_result 通知（前端据此渲染"已读取 N 个文件"摘要）=====
+    stream_chunks.append(json.dumps({
+        "type": "tool_call_result",
+        "data": {
+            "tool": "memory_search",
+            "success": (error is None),
+            "durationMs": duration_ms,
+            "resultCount": result_count,
+            "summary": f"已读取 {result_count} 个记忆片段",
+            "error": error,
+        },
+    }, ensure_ascii=False))
+
     record = ToolExecutionRecord(
         tool="memory_search",
         params={"query": query},
@@ -933,6 +970,8 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
 
     search_results = []
     search_context = ""
+    # 累积工具调用记录，用于持久化到 assistant 消息的 expertTrace 字段
+    fast_mode_tool_history: List[Dict[str, Any]] = []
 
     context_text = message
     if extracted_text:
@@ -942,23 +981,78 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         context_text += f"\n\n相关记忆：\n{memories_text}"
 
     orch_start = time.time()
-    orchestration_result = await _call_orchestration_model(context_text, message)
+    # 流式调用编排器：边生成边 yield analysis 增量给前端，实现"打字机"效果
+    orch_result_holder = {}
+    async for analysis_delta in _call_orchestration_model_stream(context_text, message, orch_result_holder):
+        # 前端收到 orchestration_chunk 后实时显示编排分析文本（逐步增长）
+        yield _json_line({"type": "orchestration_chunk", "data": {"delta": analysis_delta}})
     # 编排器耗时：DEBUG 即可；结果在下面一行打 INFO
     logger.debug("[编排器] 调用完成 dur=%.2fs", time.time() - orch_start)
+
+    orchestration_result = orch_result_holder.get("result") or {"need_search": False, "search_keywords": [], "analysis_text": "编排器调用失败"}
 
     if orchestration_result:
         need_search = orchestration_result.get("need_search", False)
         search_keywords = orchestration_result.get("search_keywords", [])
+        analysis_text = orchestration_result.get("analysis_text", "")
 
         # 编排器结果降 DEBUG：[请求结束] 已有 search=X 条数，失败仍 ERROR；需要看决策细节开 DEBUG
         logger.debug("[编排器结果] need_search=%s keywords=%s", need_search, search_keywords)
 
+        # ===== 编排步骤完成：通知前端此步的结构化信息（analysis 已通过 chunk 流式显示）=====
+        yield _json_line({"type": "orchestration_step", "data": {
+            "iteration": 1,
+            "phase": "planning",
+            "action": "search" if need_search else "reply",
+            "purpose": None,
+            # analysis 不再重复发送（已通过 orchestration_chunk 逐步显示给前端）
+        }})
+
         if need_search and search_keywords:
+            # ===== 新增：工具调用开始通知（替代旧 search_start）=====
+            yield _json_line({"type": "tool_call_start", "data": {
+                "tool": "web_search",
+                "params": {"keywords": search_keywords},
+            }})
             search_start = time.time()
             search_results = await search_service.web_search(search_keywords)
             search_context = await search_service.get_search_context(search_keywords)
+            search_dur_ms = int((time.time() - search_start) * 1000)
+            # 过滤结果（只保留 title/url）
+            filtered_results = [
+                {"title": r.get("title", ""), "url": r.get("url", "")}
+                for r in (search_results or [])
+                if r.get("url")
+            ]
+            # ===== 新增：工具调用完成通知（替代旧 search_summary，前端据此渲染工具摘要）=====
+            yield _json_line({"type": "tool_call_result", "data": {
+                "tool": "web_search",
+                "success": True,
+                "durationMs": search_dur_ms,
+                "resultCount": len(filtered_results),
+                "summary": f"已搜索 {len(filtered_results)} 个网页",
+                "results": filtered_results,
+            }})
             # 快速模式联网搜索：DEBUG 即可；结果条数在 [请求结束] 汇总行已经有了
-            logger.debug("[联网搜索] 完成 count=%s dur=%.2fs", len(search_results), time.time() - search_start)
+            logger.debug("[联网搜索] 完成 count=%s dur=%.2fs", len(search_results), search_dur_ms / 1000.0)
+            # 累积工具调用记录，用于持久化到 assistant 消息
+            fast_mode_tool_history.append({
+                "iteration": 1,
+                "action": "collect_tools",
+                "purpose": "联网搜索",
+                "analysis": orchestration_result.get("analysis_text", ""),
+                "tools": [
+                    {
+                        "tool": "web_search",
+                        "params": {"keywords": search_keywords},
+                        "success": True,
+                        "durationMs": search_dur_ms,
+                        "resultCount": len(filtered_results),
+                        "error": None,
+                        "rawResult": filtered_results,
+                    }
+                ],
+            })
 
     system_prompt = """你是爱尔奎特·布伦史塔德，高贵的真祖，月之公主，吸血鬼中的最高存在。
 
@@ -1115,24 +1209,17 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         if chunk_count == 0:
             logger.warning("[流式传输] 未收到模型返回的内容")
 
-        if search_results:
-            # 过滤搜索结果，只保留标题和URL，不保存搜索摘要（content）
-            filtered_results = []
-            for result in search_results:
-                filtered_results.append({
-                    "title": result.get("title", ""),
-                    "url": result.get("url", "")
-                })
-            yield json.dumps({"type": "search_results", "data": filtered_results}, ensure_ascii=False) + "\n"
-            # 搜索结果返回：DEBUG；结束汇总里已经有 search=X 条数
-            logger.debug("[搜索结果] 已通过流式响应返回 count=%s", len(filtered_results))
+        # 注意：搜索结果已在工具调用时通过 tool_call_result 块实时返回，不再在末尾重复汇总
+        # search_results 变量保留给 [请求结束] 汇总行使用
 
     except Exception as e:
         logger.error(f"[模型调用] 出错: {str(e)}")
         yield f"错误: {str(e)}"
 
+    # 回写图片提取内容到用户消息（必须用 user_message_uuid，不能误用 assistant UUID）
     if user_id and assistant_response:
-        if extracted_text and media_url:
+        # 修复：多图时 media_url 为 None 但 media_urls 有值，条件应同时检查两者
+        if extracted_text and (media_url or (media_urls and len(media_urls) > 0)):
             combined_content = f"[用户提问]{message}\n[图片内容]{extracted_text}" if message_type == "IMAGE" else f"[用户提问]{message}\n[文件内容]{extracted_text}"
             
             asyncio.create_task(
@@ -1150,6 +1237,20 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
                 )
             )
 
+    # 通过 SSE 流发送工具调用记录（替代 HTTP 回调，避免竞态）
+    # 后端在 SSE 流中捕获 expert_trace 事件，流结束时随 saveMessage 一起持久化
+    if fast_mode_tool_history:
+        fast_trace_payload = {
+            "finalPath": "fast_reply",
+            "iterationCount": len(fast_mode_tool_history),
+            "history": fast_mode_tool_history,
+            "deepThinkingReasoning": "",
+        }
+        yield _json_line({
+            "type": "expert_trace",
+            "data": json.dumps(fast_trace_payload, ensure_ascii=False),
+        })
+
     total_duration = time.time() - request_start_time
     # 请求结束：一行汇总，替代原来的 6 行分隔线 + 多行分类
     logger.info(
@@ -1159,12 +1260,13 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
     )
 
 
-async def _call_orchestration_model(context_text: str, message: str) -> dict:
+async def _call_orchestration_model_stream(
+    context_text: str, message: str, result_holder: dict
+) -> AsyncGenerator[str, None]:
     if not orchestration_client:
         logger.warning("[编排器] client未初始化，跳过编排")
-        return {"need_search": False, "search_keywords": [], "analysis_text": "编排器未初始化"}
-    
-    start_time = time.time()
+        result_holder["error"] = "编排器未初始化"
+        return
     
     system_prompt = """你是一个智能编排器，负责分析用户问题和上下文，决定是否需要联网搜索。
 
@@ -1232,43 +1334,67 @@ async def _call_orchestration_model(context_text: str, message: str) -> dict:
 请分析是否需要联网搜索，并生成搜索关键词。"""
 
     max_retries = 2
+    # 第一次尝试用流式，后续重试改非流式（避免前端重复显示 analysis 文本）
+    use_stream = True
+    full_text = ""
+    last_analysis_len = 0
+
     for attempt in range(1, max_retries + 1):
         try:
             response = await orchestration_client.chat.completions.create(
                 model=ORCHESTRATION_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
-                stream=False,
+                stream=use_stream,
                 temperature=0.3,
                 # 编排器输出 JSON，必须关思考：否则 reasoning 文本会混入 JSON 导致解析失败
                 **_chat_kwargs_with_thinking(disable_thinking=True),
             )
 
-            if response.usage:
-                logger.info(f"[编排器] Token消耗(模型:{ORCHESTRATION_MODEL}): prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, total={response.usage.total_tokens}")
+            if use_stream:
+                # ===== 流式模式：边接收边提取 analysis_text 增量 =====
+                full_text = ""
+                last_analysis_len = 0
+                async for chunk in response:
+                    if not chunk.choices or not chunk.choices[0].delta:
+                        continue
+                    delta = chunk.choices[0].delta.content
+                    if not delta:
+                        continue
+                    full_text += delta
+                    # 增量提取 analysis_text：只返回比上次多出来的部分
+                    current = _try_extract_analysis(full_text, keys=("analysis_text",))
+                    if len(current) > last_analysis_len:
+                        yield current[last_analysis_len:]
+                        last_analysis_len = len(current)
+            else:
+                # ===== 非流式重试模式 =====
+                if response.usage:
+                    logger.info(f"[编排器] Token消耗(模型:{ORCHESTRATION_MODEL}): prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, total={response.usage.total_tokens}")
+                if response.choices and response.choices[0].message and response.choices[0].message.content:
+                    full_text = response.choices[0].message.content.strip()
+                else:
+                    full_text = ""
 
-            if response.choices and response.choices[0].message and response.choices[0].message.content:
-                content = response.choices[0].message.content.strip()
-                
-                content = _clean_json_response(content)
-                
-                try:
-                    result = json.loads(content)
-                    if isinstance(result, dict):
-                        need_search = result.get("need_search", False)
-                        search_keywords = result.get("search_keywords", [])
-                        analysis_text = result.get("analysis_text", "")
-                        return {
-                            "need_search": need_search,
-                            "search_keywords": search_keywords,
-                            "analysis_text": analysis_text
-                        }
-                except json.JSONDecodeError as je:
-                    logger.warning(f"[编排器] 第{attempt}次调用JSON解析失败: {je}")
-                    if attempt < max_retries:
-                        user_prompt = f"""用户提问：{message}
+            # 解析完整 JSON
+            cleaned = _clean_json_response(full_text)
+            try:
+                result = json.loads(cleaned)
+                if isinstance(result, dict):
+                    if not use_stream:
+                        logger.info(f"[编排器] 重试成功")
+                    result_holder["result"] = {
+                        "need_search": result.get("need_search", False),
+                        "search_keywords": result.get("search_keywords", []),
+                        "analysis_text": result.get("analysis_text", ""),
+                    }
+                    return
+            except json.JSONDecodeError as je:
+                logger.warning(f"[编排器] 第{attempt}次调用JSON解析失败: {je}")
+                if attempt < max_retries:
+                    user_prompt = f"""用户提问：{message}
 
 上下文信息：
 {context_text[:2000]}
@@ -1278,14 +1404,59 @@ async def _call_orchestration_model(context_text: str, message: str) -> dict:
 【强制要求】
 必须输出严格的JSON格式，不要包含任何markdown代码块标记（如```json），不要包含任何解释文字。
 只输出JSON对象：{{"need_search": true/false, "search_keywords": [...], "analysis_text": "..."}}"""
+                    use_stream = False
                     continue
         except Exception as e:
             logger.error(f"[编排器] 第{attempt}次调用失败({ORCHESTRATION_MODEL}): {e}")
             if attempt < max_retries:
+                use_stream = False
                 continue
 
     logger.error(f"[编排器] 调用失败({ORCHESTRATION_MODEL})，已重试{max_retries}次")
-    return {"need_search": False, "search_keywords": [], "analysis_text": "编排器调用失败"}
+    result_holder["error"] = "编排器调用失败"
+
+
+def _try_extract_analysis(full_text: str, keys: tuple = ("analysis_text", "analysis")) -> str:
+    """
+    从可能不完整的流式 JSON 文本中提取 analysis/analysis_text 字段的值。
+
+    使用正则匹配 JSON 字符串值（支持转义），然后用 json.loads 反转义。
+    如果字段值尚未闭合（流式传输中），返回到当前末尾的所有内容。
+
+    Args:
+        full_text: 到目前为止累积的完整模型输出文本
+        keys: 要查找的字段名元组，按优先级排序
+
+    Returns: 已反转义的 analysis 文本（可能不完整）；如果未找到字段则返回空字符串
+    """
+    import re
+
+    for key in keys:
+        # 构造正则：匹配 "key" : "value" 中的 value 部分（支持转义字符）
+        # (?:[^"\\]|\\.)* 匹配：非引号非反斜杠的任意字符，或反斜杠+任意字符（转义序列）
+        key_quoted = re.escape(f'"{key}"')
+        # 先尝试匹配闭合的字符串值
+        pattern_closed = key_quoted + r'\s*:\s*"((?:[^"\\]|\\.)*)"'
+        m = re.search(pattern_closed, full_text, re.DOTALL)
+        if m:
+            raw = m.group(1)
+            try:
+                return json.loads('"' + raw + '"')
+            except (json.JSONDecodeError, ValueError):
+                # json.loads 失败时做简单反转义兜底
+                return raw.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+
+        # 再尝试匹配未闭合的字符串值（流式传输中间状态）
+        pattern_open = key_quoted + r'\s*:\s*"((?:[^"\\]|\\.)*)'
+        m = re.search(pattern_open, full_text, re.DOTALL)
+        if m:
+            raw = m.group(1)
+            try:
+                return json.loads('"' + raw + '"')
+            except (json.JSONDecodeError, ValueError):
+                return raw.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+
+    return ""
 
 
 def _clean_json_response(content: str) -> str:
@@ -1415,21 +1586,20 @@ async def chat(request: ChatRequest):
 # 专家模式：编排器（单步计划 + analysis 思考历史）
 # ==============================================================================
 
-async def _expert_call_orchestrator(state: ExpertState) -> OrchResult:
+async def _expert_call_orchestrator_stream(
+    state: ExpertState, result_holder: dict
+) -> AsyncGenerator[str, None]:
     """
-    调用专家编排器（V2）：
-    - 一次只输出单步计划（action + step + analysis）
-    - 通过「思考历史」段落让编排器了解自己之前怎么想的（用自己写的 analysis）
-    - 严禁编排器输出 reply_content，回复只交给 FINAL 阶段的 deep_thinking / reply_model
+    流式调用专家编排器（V2）：
+    - yield: analysis 的增量文本片段（供前端实时显示编排分析过程）
+    - result_holder["result"]: 流结束后写入完整解析的 OrchResult 对象；失败时 result_holder["error"] 有值
+
+    实现方式同快速模式：第一次 stream=True，重试改 stream=False
     """
     if not expert_orchestration_client:
         logger.warning("[专家模式][编排器] client 未初始化，兜底进入深度思考")
-        return OrchResult(
-            action=EXPERT_ACTION_DEEP,
-            step=None,
-            analysis="编排器 client 未初始化，兜底进入深度思考",
-            raw_output="",
-        )
+        result_holder["error"] = "编排器 client 未初始化"
+        return
 
     # 构建对话历史（最近 10 条，供编排器参考上下文一致性）
     history_text = ""
@@ -1526,6 +1696,11 @@ C. 极其简单问题（纯问候、谢谢、再见、极短常识），直接�
 请按你 system prompt 里规定的 JSON 格式输出本轮的单步编排决策。"""
 
     max_retries = 2
+    # 第一次尝试用流式，后续重试改非流式（避免前端重复显示 analysis 文本）
+    use_stream = True
+    full_text = ""
+    last_analysis_len = 0
+
     for attempt in range(1, max_retries + 1):
         try:
             response = await expert_orchestration_client.chat.completions.create(
@@ -1534,41 +1709,67 @@ C. 极其简单问题（纯问候、谢谢、再见、极短常识），直接�
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                stream=False,
+                stream=use_stream,
                 temperature=0.7,
                 max_tokens=3000,
                 # 专家编排器输出 JSON，必须关思考：reasoning 会破坏 JSON 解析
                 **_chat_kwargs_with_thinking(disable_thinking=True),
             )
-            # Token 日志（只打日志，不存持久化，精简字段）
-            if response.usage:
-                logger.info(
-                    f"[编排器]Token消耗(模型:{EXPERT_ORCHESTRATION_MODEL}): "
-                    f"prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, "
-                    f"total={response.usage.total_tokens}"
-                )
-            if response.choices and response.choices[0].message and response.choices[0].message.content:
-                raw = response.choices[0].message.content.strip()
-                cleaned = _clean_json_response(raw)
-                try:
-                    obj = json.loads(cleaned)
-                    return _parse_orch_result(obj, raw)
-                except json.JSONDecodeError as je:
-                    logger.warning(f"[专家模式][编排器] 第{attempt}次 JSON 解析失败: {je}, 内容={cleaned[:120]}")
-                    if attempt < max_retries:
-                        user_prompt += (
-                            "\n\n【上次解析错误，请修正输出】"
-                            "\n强制要求：只输出纯 JSON，不要 ```json``` 代码块，不要任何解释文字。"
-                            "\n必须包含 action、analysis 字段。action=collect_tools 时还要有 step。"
-                        )
+
+            if use_stream:
+                # ===== 流式模式：边接收边提取 analysis 增量 =====
+                full_text = ""
+                last_analysis_len = 0
+                async for chunk in response:
+                    if not chunk.choices or not chunk.choices[0].delta:
                         continue
+                    delta = chunk.choices[0].delta.content
+                    if not delta:
+                        continue
+                    full_text += delta
+                    # 增量提取 analysis：只返回比上次多出来的部分
+                    current = _try_extract_analysis(full_text, keys=("analysis",))
+                    if len(current) > last_analysis_len:
+                        yield current[last_analysis_len:]
+                        last_analysis_len = len(current)
+            else:
+                # ===== 非流式重试模式 =====
+                # Token 日志（只打日志，不存持久化，精简字段）
+                if response.usage:
+                    logger.info(
+                        f"[编排器]Token消耗(模型:{EXPERT_ORCHESTRATION_MODEL}): "
+                        f"prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}, "
+                        f"total={response.usage.total_tokens}"
+                    )
+                if response.choices and response.choices[0].message and response.choices[0].message.content:
+                    full_text = response.choices[0].message.content.strip()
+                else:
+                    full_text = ""
+
+            # 解析完整 JSON
+            cleaned = _clean_json_response(full_text)
+            try:
+                obj = json.loads(cleaned)
+                result_holder["result"] = _parse_orch_result(obj, full_text)
+                return
+            except json.JSONDecodeError as je:
+                logger.warning(f"[专家模式][编排器] 第{attempt}次 JSON 解析失败: {je}, 内容={cleaned[:120]}")
+                if attempt < max_retries:
+                    user_prompt += (
+                        "\n\n【上次解析错误，请修正输出】"
+                        "\n强制要求：只输出纯 JSON，不要 ```json``` 代码块，不要任何解释文字。"
+                        "\n必须包含 action、analysis 字段。action=collect_tools 时还要有 step。"
+                    )
+                    use_stream = False
+                    continue
         except Exception as e:
             logger.error(f"[专家模式][编排器] 第{attempt}次调用失败({EXPERT_ORCHESTRATION_MODEL}): {e}")
             if attempt < max_retries:
+                use_stream = False
                 continue
 
     logger.error(f"[专家模式][编排器] 全部重试失败，兜底进入深度思考")
-    return OrchResult(action=EXPERT_ACTION_DEEP, step=None, analysis="编排器调用失败，兜底进入深度思考", raw_output="")
+    result_holder["error"] = "编排器调用失败"
 
 
 def _parse_orch_result(obj: dict, raw_output: str) -> OrchResult:
@@ -1726,14 +1927,16 @@ async def _expert_final_deep_thinking(state: ExpertState) -> AsyncIterator[str]:
                 )
                 content = delta.content
                 if reasoning:
+                    # 累积深度思考推理链全文，用于持久化到 expertTrace
+                    state.deep_thinking_reasoning += reasoning
                     yield _json_line({"type": "thinking", "data": reasoning})
                 if content:
                     chunk_count += 1
                     state.assistant_response += content
                     yield _json_line({"type": "content", "data": content})
-                    # 没有 reasoning 的老端点：把内容也追加到思考栏，保持 UI 一致
-                    if not reasoning:
-                        yield _json_line({"type": "thinking", "data": content})
+                    # 修复：不再把 content 双发到 thinking 频道
+                    # 之前旧逻辑"无 reasoning 时把 content 也追加到思考栏"会导致
+                    # 前端思考过程和最终回复完全重复，用户反馈此问题
         duration = time.time() - start_time
         if hasattr(response, "usage") and response.usage:
             logger.info(
@@ -1881,6 +2084,8 @@ def _build_expert_trace_payload(state: ExpertState) -> Dict[str, Any]:
         "finalPath": state.final_path,
         "iterationCount": len([1 for r in state.orch_history if r.action]),
         "history": history_arr,
+        # 深度思考推理链全文（与工具调用结果同等持久化，用户要求）
+        "deepThinkingReasoning": state.deep_thinking_reasoning,
     }
     return payload
 
@@ -2055,7 +2260,15 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
             logger.info(
                 f"[专家模式][DECIDING] 第 {state.iteration}/{state.max_iterations} 次编排"
             )
-            orch = await _expert_call_orchestrator(state)
+            # 流式调用编排器：边生成边 yield analysis 增量给前端，实现"打字机"效果
+            orch_result_holder = {}
+            async for analysis_delta in _expert_call_orchestrator_stream(state, orch_result_holder):
+                yield _json_line({"type": "orchestration_chunk", "data": {"delta": analysis_delta}})
+
+            orch = orch_result_holder.get("result") or OrchResult(
+                action=EXPERT_ACTION_DEEP, step=None,
+                analysis="编排器调用失败，兜底进入深度思考", raw_output="",
+            )
             state.pending_orch = orch
             logger.info(
                 f"[专家模式][DECIDING] 编排结果: action={orch.action}, "
@@ -2063,6 +2276,15 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
                 f"tools={[t.tool for t in (orch.step.tools if orch.step else [])]}, "
                 f"analysis={orch.analysis[:80]}"
             )
+
+            # ===== 编排步骤完成：通知前端结构化信息（analysis 已通过 chunk 流式显示）=====
+            yield _json_line({"type": "orchestration_step", "data": {
+                "iteration": state.iteration,
+                "phase": "planning" if orch.action == EXPERT_ACTION_COLLECT else "thinking",
+                "action": orch.action,
+                "purpose": (orch.step.purpose if orch.step else None),
+                # analysis 不再重复发送（已通过 orchestration_chunk 逐步显示给前端）
+            }})
 
             # 本轮 orch 先填一个占位 history record，等 EXECUTING（或 FINAL）结束后再回填 tools 执行结果
             rec = OrchHistoryRecord(
@@ -2136,21 +2358,14 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
         async for line in _expert_final_reply_model(state):
             yield line
 
-    # ========== 4. 输出 search_results 汇总块（兼容现有前端/后端 searchResults 字段机制） ==========
-    if state.search_results_flattened:
-        yield _json_line({"type": "search_results", "data": state.search_results_flattened})
-        logger.info(f"[专家模式][搜索结果] 汇总块，总数={len(state.search_results_flattened)}")
-
-    # ========== 5. 持久化 expertTrace（等回复完一起写，MySQL + Redis 会话详情表消息 JSON 里） ==========
+    # ========== 4. 通过 SSE 流发送 expertTrace（替代 HTTP 回调，避免竞态） ==========
+    # 后端在 SSE 流中捕获 expert_trace 事件，流结束时随 saveMessage 一起持久化
+    # 不再使用 asyncio.create_task(update_backend_expert_trace) 避免 Redis 扫不到消息的竞态
     expert_trace_payload = _build_expert_trace_payload(state)
-    # 用 create_task 异步跑（不阻塞响应结束），但响应整体结束前也 fire-and-forget；
-    # 失败只打日志（沿用你之前决策：不重试）
-    if state.session_id and state.message_uuid:
-        asyncio.create_task(update_backend_expert_trace(
-            int(state.session_id) if str(state.session_id).isdigit() else None,
-            state.message_uuid,
-            expert_trace_payload,
-        ))
+    yield _json_line({
+        "type": "expert_trace",
+        "data": json.dumps(expert_trace_payload, ensure_ascii=False),
+    })
 
     # ========== 6. 异步保存记忆（保持原逻辑：用户消息 + 提取内容 + 最终回复） ==========
     if user_id and state.assistant_response:
@@ -2168,11 +2383,13 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
                 f"[专家模式][记忆持久化] 启动异步任务（含媒体提取）, "
                 f"消息长度={len(message)}, 提取长度={len(state.extracted_text)}, 回复长度={len(state.assistant_response)}"
             )
-            if state.message_uuid and state.session_id:
+            if state.user_message_uuid and state.session_id:
                 try:
+                    # 修复：必须用 user_message_uuid（用户消息UUID），
+                    # 不能用 message_uuid（现在是assistant UUID，会被role校验拒绝）
                     await update_backend_message_content(
                         int(state.session_id) if str(state.session_id).isdigit() else None,
-                        state.message_uuid, message, state.extracted_text,
+                        state.user_message_uuid, message, state.extracted_text,
                     )
                 except Exception as e:
                     logger.warning(f"[专家模式] 回写图片提取内容失败: {e}")

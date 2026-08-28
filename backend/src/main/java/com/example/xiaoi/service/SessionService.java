@@ -46,6 +46,15 @@ public interface SessionService {
     void saveMessage(Long sessionId, Map<String, Object> message, String messageType, String mediaUrl);
 
     /**
+     * 仅保存占位消息到 Redis（不写 MySQL）。
+     * 用于 SSE 流开始前预存 assistant 消息，确保 Agent 的 expertTrace 回写能扫到 UUID。
+     * 流结束后调用 saveMessage 或 updateMessageContent 完成正式持久化。
+     * @param sessionId 会话 ID
+     * @param message 消息内容（含 role/content/messageUuid 等）
+     */
+    void savePlaceholderToRedis(Long sessionId, Map<String, Object> message);
+
+    /**
      * 分页获取会话消息（从 MySQL 读取）
      * 第一页查询后会预热 Redis 缓存
      * @param sessionId 会话 ID
