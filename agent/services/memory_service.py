@@ -18,6 +18,23 @@ from config.settings import (
     EXTRACTION_MODEL, EXTRACTION_API_KEY, EXTRACTION_API_BASE,
     API_KEY, API_BASE
 )
+# ========== 以下为新集中配置文件引入，消除散落的硬编码字面量 ==========
+# 行为参数（温度/top_k/权重/截断/停用词）统一放到 config.behavior
+from config.behavior import (
+    STOPWORDS, TOKEN_MIN_LEN,
+    BM25_K1, BM25_B, BM25_AVG_DOC_LEN_HINT, BM25_LOG_KEYWORDS_TOP_N,
+    HYBRID_DENSE_BASE_WEIGHT, HYBRID_BM25_WEIGHT, HYBRID_IMPORTANCE_WEIGHT,
+    MEMORY_SEARCH_DEFAULT_TOP_K,
+    MEMORY_EXTRACTION_TEMPERATURE, MEMORY_EXTRACTION_MAX_TOKENS,
+    MEMORY_EXTRACTION_MAX_RETRIES, MEMORY_EXTRACTION_FALLBACK_MODEL,
+    MEMORY_CONTENT_DEFAULT_MAX_LENGTH,
+    MEMORY_COUNT_BASELINE_NO_MEDIA, MEMORY_COUNT_BASELINE_MINIMUM,
+)
+# Prompt 大段文本统一放到 config.prompts.memory_extraction
+from config.prompts.memory_extraction import (
+    MEMORY_EXTRACTION_SYSTEM_PROMPT,
+    build_memory_extraction_user_prompt,
+)
 
 logger = logging.getLogger("XiaoAi Memory Service")
 
@@ -149,32 +166,35 @@ class MemoryService:
 
     def _tokenize(self, text: str) -> List[str]:
         """
-        中英文分词，使用jieba处理中文，正则处理英文，过滤停用词
+        中英文分词，使用jieba处理中文，正则处理英文，过滤停用词。
+        停用词表、最小token长度统一从 config.behavior 读取，便于后续调优。
         :param text: 输入文本
         :return: 分词结果列表
         """
         text = text.lower()
-        
+
         chinese_tokens = jieba.lcut(text)
-        
+
         english_tokens = re.findall(r'[a-zA-Z]+', text)
-        
-        stopwords = {'的', '了', '是', '在', '我', '有', '和', '就', '不', '人', '都', '一', '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好', '自己', '这', '那', '那是', '但是', '所以', '因为', '如果', '虽然', '但是', '而且', '或者', '还是', '的话', '吗', '呢', '啊', '哦', '嗯', '吧', '呀', '哇', '哈', '嘿', '哼', '唉', '咦', '嗯', '唔', '哦'}
-        
+
+        # 停用词集合从配置读取（避免每次 _tokenize 都构造一个 set 字面量，节省 GC）
+        stopwords = STOPWORDS
+
         tokens = []
         for token in chinese_tokens:
-            if len(token) >= 2 and token not in stopwords:
+            if len(token) >= TOKEN_MIN_LEN and token not in stopwords:
                 tokens.append(token)
-        
+
         for token in english_tokens:
-            if len(token) >= 2 and token.lower() not in stopwords:
+            if len(token) >= TOKEN_MIN_LEN and token.lower() not in stopwords:
                 tokens.append(token.lower())
-        
+
         return tokens
 
     def _calculate_bm25(self, text: str) -> Dict[str, float]:
         """
-        计算BM25关键词分数，基于TF（词频）和简化的IDF
+        计算BM25关键词分数，基于TF（词频）和简化的IDF。
+        参数 k1 / b / 平均文档长度 统一放到 config.behavior 便于调权。
         :param text: 输入文本
         :return: 关键词及其分数的字典
         """
@@ -182,12 +202,14 @@ class MemoryService:
         token_counts = Counter(tokens)
         max_freq = max(token_counts.values()) if token_counts else 1
 
-        k1 = 1.2
-        b = 0.75
+        # 从配置读取 BM25 核心超参
+        k1 = BM25_K1
+        b = BM25_B
+        avgdl = BM25_AVG_DOC_LEN_HINT
 
         scores = {}
         for token, count in token_counts.items():
-            tf = (count * (k1 + 1)) / (count + k1 * (1 - b + b * len(tokens) / 100))
+            tf = (count * (k1 + 1)) / (count + k1 * (1 - b + b * len(tokens) / avgdl))
             scores[token] = float(tf)
 
         return scores
@@ -217,7 +239,11 @@ class MemoryService:
     async def extract_memory_units(self, user_message: str, assistant_message: str,
                                    user_id: int, session_id: str = None, existing_memories: List[str] = None) -> List[Dict[str, Any]]:
         """
-        从对话中提取记忆单元，调用记忆提取模型进行语义分析
+        从对话中提取记忆单元，调用记忆提取模型进行语义分析。
+        【硬编码移除】
+          - system_prompt / user_prompt 统一放到 config.prompts.memory_extraction；
+          - 字数/条数/温度/重试次数/fallback 模型名统一放到 config.behavior；
+          便于后续调参和多语言改造。
         :param user_message: 用户消息
         :param assistant_message: 助手回复
         :param user_id: 用户ID
@@ -228,114 +254,20 @@ class MemoryService:
         messages_text = f"User: {user_message}\nAssistant: {assistant_message}"
         logger.debug(f"开始记忆提取: user_id={user_id}, session_id={session_id}, message='{user_message[:50]}...'")
 
-        system_prompt = """你是一个专业的记忆提取助手，负责从用户与AI助手爱尔奎特的对话中提取长期记忆。
-
-【记忆类型定义】
-- FACTS：客观事实、知识、数据、属性（如：用户是程序员、身高180cm、图片中的文字内容）
-- PREFERENCES：用户偏好、喜好、厌恶、习惯（如：喜欢川菜、讨厌香菜、喜欢猫）
-- ENTITY：重要实体、人物、地点、事物（如：父母、北京、iPhone、图片中的关键对象）
-- RELATION：实体之间的关系（如：用户是小明的同事、公司在上海）
-- EVENT：事件、经历、计划、目标（如：下周去旅游、昨天看电影、图片中的场景）
-- NEEDS：用户需求、意图、问题、关注点（如：用户想了解微信、用户有问题要问）
-
-【提取规则】
-1. 提取本轮对话中用户提到的任何有用信息，不要重复已有记忆列表中的内容
-2. 每条记忆内容简洁（10-60字），使用陈述句，不改变原意
-3. 重要性评分标准：
-   - 0.8-1.0：核心信息（用户身份、长期偏好、重要事件、核心需求）
-   - 0.5-0.7：有用信息（短期偏好、次要事实、次要需求）
-   - 0.1-0.4：边缘信息（临时想法、无关细节）
-4. 实体提取：列出记忆内容中涉及的关键名词，用中文，不超过5个
-5. 以下情况也要提取：用户提到的事物、表达的兴趣、提出的问题、表达的情感
-6. 只有纯问候语（如"你好"、"再见"）才输出空数组
-7. 对话中标注为[图片内容]的部分代表用户上传图片的视觉信息，应提取为FACTS或ENTITY类型记忆
-8. 从图片中提取的信息包括：图片中的文字内容、图片描述的对象/场景、图片展示的关键信息
-
-【高质量记忆示例】
-
-示例1：
-对话内容：
-User: 我是一名Java后端开发，平时喜欢吃川菜，特别喜欢麻辣火锅
-Assistant: 原来如此，Java后端开发是个不错的职业呢，川菜确实很美味
-
-提取结果：
-[
-  {"content": "用户是一名Java后端开发工程师", "type": "FACTS", "importance_score": 0.9, "entities": ["Java", "后端开发"]},
-  {"content": "用户喜欢吃川菜，尤其喜欢麻辣火锅", "type": "PREFERENCES", "importance_score": 0.85, "entities": ["川菜", "麻辣火锅"]}
-]
-
-示例2：
-对话内容：
-User: [用户提问]这张照片里是什么？[图片内容]图片显示一只白色的猫坐在沙发上，背景是灰色的墙壁，猫看起来很放松
-Assistant: 这是一只白色的猫咪，看起来很可爱
-
-提取结果：
-[
-  {"content": "用户上传了一张白色猫咪坐在沙发上的照片", "type": "FACTS", "importance_score": 0.6, "entities": ["猫咪", "沙发"]},
-  {"content": "用户可能喜欢猫", "type": "PREFERENCES", "importance_score": 0.55, "entities": ["猫"]}
-]
-
-示例3：
-对话内容：
-User: [用户提问]帮我看看这段代码有什么问题？[图片内容]图片显示一段Python代码，定义了一个名为calculate的函数，使用了Java的语法结构，有语法错误
-Assistant: 这段代码使用了Java的语法写Python，需要修改
-
-提取结果：
-[
-  {"content": "用户正在学习Python编程", "type": "FACTS", "importance_score": 0.7, "entities": ["Python", "编程"]},
-  {"content": "用户遇到了Python代码语法错误", "type": "NEEDS", "importance_score": 0.65, "entities": ["代码", "语法"]}
-]
-
-示例4：
-对话内容：
-User: [用户提问]这是我家的风景照[图片内容]图片显示一片美丽的海滩，蓝色的大海和白色的沙滩，远处有椰子树
-Assistant: 你的家乡风景真美
-
-提取结果：
-[
-  {"content": "用户家乡有美丽的海滩风景", "type": "FACTS", "importance_score": 0.75, "entities": ["海滩", "家乡"]},
-  {"content": "用户喜欢海滩风景", "type": "PREFERENCES", "importance_score": 0.5, "entities": ["海滩"]}
-]
-
-示例5：
-对话内容：
-User: 我下周要去杭州旅游，和女朋友小红一起
-Assistant: 杭州是个很美的城市，祝你们玩得开心
-
-提取结果：
-[
-  {"content": "用户计划下周末和女朋友去杭州旅游", "type": "EVENT", "importance_score": 0.75, "entities": ["杭州", "旅游"]},
-  {"content": "用户的女朋友叫小红", "type": "ENTITY", "importance_score": 0.8, "entities": ["小红"]}
-]
-
-示例6：
-对话内容：
-User: 你好
-Assistant: 你好
-
-提取结果：
-[]
-
-【输出要求】
-- 必须输出严格的JSON数组格式，不要包含任何其他文字
-- 确保JSON格式正确，逗号、引号、括号配对完整
-- 如果没有可提取的记忆，输出空数组：[]"""
-
+        # 根据 [图片/文件内容] 出现次数，给出最少提取条数：max(MEMORY_COUNT_BASELINE_MINIMUM, MEMORY_COUNT_BASELINE_NO_MEDIA + media_count)
         media_count = messages_text.count("[图片内容]") + messages_text.count("[文件内容]")
-        max_memory_count = max(5, 3 + media_count)
-        max_content_length = 80
+        max_memory_count = max(MEMORY_COUNT_BASELINE_MINIMUM, MEMORY_COUNT_BASELINE_NO_MEDIA + media_count)
+        max_content_length = MEMORY_CONTENT_DEFAULT_MAX_LENGTH
 
-        user_prompt = f"""对话内容：
-{messages_text}
-
-已有记忆：
-{existing_memories if existing_memories else "无"}
-
-约束条件：
-- 每条记忆内容长度不超过{max_content_length}字
-- 提取的记忆数量不超过{max_memory_count}条
-
-请提取本轮对话的关键记忆。"""
+        # system_prompt 统一读配置
+        system_prompt = MEMORY_EXTRACTION_SYSTEM_PROMPT
+        # 首次调用 user_prompt 使用"正常"模式（已有记忆可引用）
+        user_prompt = build_memory_extraction_user_prompt(
+            messages_text, existing_memories,
+            max_content_length=max_content_length,
+            max_memory_count=max_memory_count,
+            strict_without_existing=False,
+        )
 
         try:
             if self.extraction_client and self.extraction_model:
@@ -343,9 +275,14 @@ Assistant: 你好
                 model = self.extraction_model
             else:
                 client = AsyncOpenAI(api_key=API_KEY, base_url=API_BASE)
-                model = "qwen3.7-plus"
+                model = MEMORY_EXTRACTION_FALLBACK_MODEL
 
-            memory_units = await self._extract_with_retry(client, model, system_prompt, user_prompt, messages_text, user_id, session_id, max_memory_count, max_content_length)
+            memory_units = await self._extract_with_retry(
+                client, model,
+                system_prompt, user_prompt,
+                messages_text, user_id, session_id,
+                max_memory_count, max_content_length,
+            )
             return memory_units
         except Exception as e:
             logger.error(f"记忆提取失败: {e}")
@@ -353,9 +290,10 @@ Assistant: 你好
 
     async def _extract_with_retry(self, client, model, system_prompt, user_prompt, messages_text, user_id, session_id: str, max_memory_count, max_content_length):
         """
-        带重试的记忆提取，格式校验失败时重试一次
+        带重试的记忆提取，格式校验失败时重试一次。
+        所有超参（重试次数/温度/max_tokens/关思考开关）集中到 config.behavior 和 prompts 配置。
         """
-        max_retries = 2
+        max_retries = MEMORY_EXTRACTION_MAX_RETRIES
         for attempt in range(1, max_retries + 1):
             # 记忆提取：强制关闭思考（推理内容会破坏 JSON 数组解析结构，导致提取为空）
             response = await client.chat.completions.create(
@@ -364,21 +302,21 @@ Assistant: 你好
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.3,
-                max_tokens=2000,
+                temperature=MEMORY_EXTRACTION_TEMPERATURE,
+                max_tokens=MEMORY_EXTRACTION_MAX_TOKENS,
                 **_extraction_extra_kwargs()
             )
 
             if response.choices and response.choices[0].message and response.choices[0].message.content:
                 content = response.choices[0].message.content.strip()
                 logger.debug(f"记忆提取模型原始响应(第{attempt}次): {content}")
-                
+
                 content = content.strip()
                 if content.startswith("```"):
                     content = content.split("```")[1]
                     if content.startswith("json"):
                         content = content[4:].strip()
-                
+
                 import json
                 try:
                     memory_units = json.loads(content)
@@ -391,12 +329,12 @@ Assistant: 你好
                                     valid_units.append(unit)
                                 else:
                                     logger.debug(f"记忆内容过长({len(content_str)}>={max_content_length}), 跳过")
-                        
+
                         for unit in valid_units:
                             unit["userId"] = user_id
                             unit["sessionId"] = session_id
                             unit["timestamp"] = int(asyncio.get_event_loop().time())
-                        
+
                         if len(valid_units) == 0:
                             logger.info(f"提取结果: 空数组(纯问候语或无新信息), user_id={user_id}, session_id={session_id}")
                         else:
@@ -404,22 +342,22 @@ Assistant: 你好
                         return valid_units
                 except json.JSONDecodeError:
                     logger.warning(f"第{attempt}次提取格式校验失败: {content[:300]}")
-            
+
             if attempt < max_retries:
                 logger.info(f"第{attempt}次提取失败，准备重试...")
-                user_prompt = f"""对话内容：
-{messages_text}
+                # 重试用 strict_without_existing=True 清空"已有记忆"引用，避免旧记忆干扰导致格式出问题
+                user_prompt = build_memory_extraction_user_prompt(
+                    messages_text, None,
+                    max_content_length=max_content_length,
+                    max_memory_count=max_memory_count,
+                    strict_without_existing=True,
+                )
+                # 在严格重试模式下额外追加强约束行（与原硬编码完全一致）
+                user_prompt += (
+                    "\n- 必须输出严格的JSON数组格式，不要包含任何其他文字\n\n"
+                    "请重新提取本轮对话的关键记忆。"
+                )
 
-已有记忆：
-无
-
-约束条件：
-- 每条记忆内容长度不超过{max_content_length}字
-- 提取的记忆数量不超过{max_memory_count}条
-- 必须输出严格的JSON数组格式，不要包含任何其他文字
-
-请重新提取本轮对话的关键记忆。"""
-        
         logger.info(f"提取结果: 重试{max_retries}次仍失败, user_id={user_id}, session_id={session_id}")
         return []
 
@@ -594,17 +532,24 @@ Assistant: 你好
         else:
             logger.warning(f"📥 处理后没有有效的记忆点需要存储(字面去重={skipped_literal}, 向量去重={skipped_vector}, 嵌入失败={failed_embedding})")
 
-    async def search_memories(self, query: str, session_id: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    async def search_memories(self, query: str, session_id: str, top_k: int = None) -> List[Dict[str, Any]]:
         """
-        混合搜索记忆：稠密向量搜索 + BM25关键词搜索 + 重要性分数融合 + Rerank重排序
+        混合搜索记忆：稠密向量搜索 + BM25关键词搜索 + 重要性分数融合 + Rerank重排序。
+        【硬编码移除】
+          - top_k 默认值由 MEMORY_SEARCH_DEFAULT_TOP_K 提供（避免调用方漏传时行为不一）
+          - BM25 关键字遍历上限、打分公式权重统一来自 config.behavior
         :param query: 查询文本
         :param session_id: 会话ID
-        :param top_k: 返回结果数量
+        :param top_k: 返回结果数量（None 时读默认 MEMORY_SEARCH_DEFAULT_TOP_K）
         :return: 排序后的记忆结果列表
         """
         if not self.embedding_client:
             logger.warning("嵌入客户端未初始化, 跳过记忆检索")
             return []
+
+        # top_k 缺省走配置（调用处目前有显式 top_k=5；这里兜底防止新增调用忘了传参）
+        if top_k is None:
+            top_k = MEMORY_SEARCH_DEFAULT_TOP_K
 
         logger.info(f"🔍 开始记忆检索, session_id={session_id}, 查询='{query[:50]}...', top_k={top_k}")
 
@@ -615,7 +560,7 @@ Assistant: 你好
 
         bm25_scores = self._calculate_bm25(query)
         keywords = list(bm25_scores.keys())
-        logger.debug(f"BM25关键词提取: {keywords[:5]}")
+        logger.debug(f"BM25关键词提取: {keywords[:BM25_LOG_KEYWORDS_TOP_N]}")
 
         try:
             dense_results = self.qdrant_client.query_points(
@@ -635,18 +580,20 @@ Assistant: 你好
             result_dict = {}
             for point in dense_results.points:
                 point_id = point.id
+                # dense 分数按 HYBRID_DENSE_BASE_WEIGHT 倍作为"基础分"（保持原值），便于之后调 dense 权重
+                base_dense = point.score * HYBRID_DENSE_BASE_WEIGHT
                 result_dict[point_id] = {
                     "content": point.payload.get("content", ""),
                     "type": point.payload.get("type", "FACTS"),
                     "importance_score": point.payload.get("importance_score", 0.5),
                     "entities": point.payload.get("entities", []),
                     "dense_score": point.score,
-                    "score": point.score
+                    "score": base_dense,
                 }
 
             if keywords:
                 logger.info(f"🔹 执行BM25关键词搜索, 关键词数量={len(keywords)}")
-                for keyword in keywords[:5]:
+                for keyword in keywords[:BM25_LOG_KEYWORDS_TOP_N]:
                     keyword_results = self.qdrant_client.query_points(
                         collection_name=QDRANT_COLLECTION,
                         query=dense_vector,
@@ -676,12 +623,18 @@ Assistant: 你好
                                 "importance_score": point.payload.get("importance_score", 0.5),
                                 "entities": point.payload.get("entities", []),
                                 "dense_score": 0,
-                                "score": 0
+                                "score": 0,
                             }
-                        result_dict[point_id]["score"] += point.score * bm25_scores[keyword] * 0.3
+                        # BM25 贡献分 = point.score * bm25_keyword_weight * HYBRID_BM25_WEIGHT
+                        result_dict[point_id]["score"] += (
+                            point.score * bm25_scores[keyword] * HYBRID_BM25_WEIGHT
+                        )
 
+            # 重要性加权：importance_score × HYBRID_IMPORTANCE_WEIGHT（原硬编码 0.1）
             for point_id in result_dict:
-                result_dict[point_id]["score"] += result_dict[point_id].get("importance_score", 0.5) * 0.1
+                result_dict[point_id]["score"] += (
+                    result_dict[point_id].get("importance_score", 0.5) * HYBRID_IMPORTANCE_WEIGHT
+                )
 
             sorted_results = sorted(result_dict.values(), key=lambda x: x["score"], reverse=True)[:top_k]
             logger.info(f"🔹 混合搜索合并 {len(result_dict)} 条唯一结果, 过滤后保留 {len(sorted_results)} 条")
@@ -695,7 +648,7 @@ Assistant: 你好
             logger.info(f"✅ 记忆检索完成: {len(sorted_results)} 条结果")
             for i, result in enumerate(sorted_results[:3], 1):
                 logger.info(f"  结果 #{i}: '{result['content'][:60]}...' (分数={result['score']:.4f})")
-            
+
             return sorted_results
         except Exception as e:
             logger.error(f"❌ 记忆检索失败: {e}")
