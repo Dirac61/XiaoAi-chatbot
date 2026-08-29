@@ -76,6 +76,98 @@ load_dotenv()
 from services.memory_service import memory_service
 from services.search_service import search_service
 
+# ========== 【硬编码迁移】集中配置导入 ==========
+# 所有 prompt 大文本统一放到 config.prompts.*，避免 main.py 里散落 2000 行字符串
+from config.prompts.persona import (
+    PERSONA_SYSTEM_PROMPT,
+    PERSONA_MEMORY_SECTION_TITLE,
+    PERSONA_SEARCH_SECTION_TITLE,
+)
+from config.prompts.ocr import (
+    OCR_SINGLE_IMAGE_SYSTEM_PROMPT, OCR_SINGLE_IMAGE_USER_TEXT,
+    OCR_MULTI_IMAGE_SYSTEM_PROMPT, OCR_MULTI_IMAGE_USER_TEXT,
+    OCR_DISABLE_THINKING,
+)
+from config.prompts.orchestrator_fast import (
+    FAST_ORCH_SYSTEM_PROMPT, build_fast_orch_user_prompt,
+)
+from config.prompts.orchestrator_expert import (
+    build_expert_orch_system_prompt, build_expert_orch_user_prompt,
+    EXPERT_ORCH_USER_RETRY_APPEND,
+)
+from config.prompts.deep_thinking import (
+    DEEP_THINKING_SYSTEM_PROMPT,
+    DEEP_THINKING_START_MESSAGE,
+    DEEP_THINKING_REASONING_EFFORT,
+)
+from config.prompts.reply_directly import (
+    REPLY_DIRECTLY_SYSTEM_PROMPT,
+    build_reply_directly_user_prompt,
+)
+from config.prompts.summarize import (
+    SUMMARIZE_SYSTEM_PROMPT,
+    build_summarize_user_prompt,
+    SUMMARIZE_DISABLE_THINKING,
+)
+from config.prompts.context import (
+    build_global_context_text,
+    build_thinking_history_text,
+    format_recent_history_for_llm,
+    USER_PREFIX_UPLOAD_SINGLE_IMAGE,
+    USER_PREFIX_UPLOAD_SINGLE_IMAGE_WITH_EXTRACTED,
+    USER_PREFIX_UPLOAD_SINGLE_FILE,
+    USER_PREFIX_UPLOAD_MULTI_FILES,
+    HISTORY_IMAGE_PREFIX_SIMPLE,
+    HISTORY_IMAGE_PREFIX_WITH_EXTRACTED,
+    HISTORY_FILE_PREFIX_SIMPLE,
+    HISTORY_FILE_PREFIX_WITH_EXTRACTED,
+    FILE_TEXT_BLOCK_PREFIX,
+)
+
+# 行为参数（温度/截断/权重/重试/超时/top_k）统一放到 config.behavior
+from config.behavior import (
+    # 文本截断
+    MEDIA_EXTRACTED_MAX_LEN,
+    FAST_ORCH_CONTEXT_MAX_LEN,
+    HISTORY_SNIPPET_MAX_LEN_EACH,
+    LOG_ANALYSIS_TRUNCATE_LEN,
+    LOG_USER_MESSAGE_TRUNCATE_LEN,
+    # 各模型温度 / max_tokens / 重试
+    OCR_TEMPERATURE,
+    FAST_ORCH_TEMPERATURE, FAST_ORCH_MAX_RETRIES,
+    EXPERT_ORCH_TEMPERATURE, EXPERT_ORCH_MAX_TOKENS, EXPERT_ORCH_MAX_RETRIES,
+    DEEP_THINKING_TEMPERATURE,
+    REPLY_DIRECTLY_TEMPERATURE, REPLY_DIRECTLY_MAX_TOKENS,
+    SUMMARIZE_TEMPERATURE,
+    MEMORY_SEARCH_DEFAULT_TOP_K,
+    # 后端 / HTTP 超时
+    BACKEND_INTERNAL_API_TIMEOUT, BACKEND_INTERNAL_API_CONNECT_TIMEOUT,
+    CLIENT_TIMEOUT_READ_GENERAL, CLIENT_TIMEOUT_CONNECT_DEFAULT,
+    CLIENT_TIMEOUT_READ_ORCHESTRATION, CLIENT_TIMEOUT_READ_DEEP_THINKING,
+    # 文件扩展名白名单 / URL 前缀判断
+    PLAIN_TEXT_EXTENSIONS, SUPPORTED_FILE_EXTENSIONS,
+    URL_PREFIX_DATA_IMAGE, URL_PREFIX_HTTP,
+    # 专家模式 dataclass 兜底默认值
+    EXPERT_STATE_DEFAULT_MAX_ITERATIONS, EXPERT_STATE_DEFAULT_HISTORY,
+)
+
+# 工具协议常量（动作枚举、工具名、SSE 摘要模板、后端接口后缀、mediaType）
+from config.tools import (
+    EXPERT_ACTION_COLLECT, EXPERT_ACTION_DEEP, EXPERT_ACTION_REPLY,
+    EXPERT_FINAL_PATH_DEEP, EXPERT_FINAL_PATH_REPLY, FAST_MODE_FINAL_PATH,
+    TOOL_NAME_WEB_SEARCH, TOOL_NAME_MEMORY_SEARCH,
+    TOOL_DESC_WEB_SEARCH, TOOL_DESC_MEMORY_SEARCH,
+    SUMMARY_TEMPLATE_WEB_SEARCH, SUMMARY_TEMPLATE_MEMORY_SEARCH,
+    SUMMARY_TEMPLATE_WEB_SEARCH_FAIL, SUMMARY_TEMPLATE_MEMORY_SEARCH_FAIL,
+    ORCH_PHASE_PLANNING, ORCH_PHASE_THINKING,
+    BACKEND_ENDPOINT_UPDATE_SEARCH_RESULTS,
+    BACKEND_ENDPOINT_UPDATE_MESSAGE_CONTENT,
+    BACKEND_ENDPOINT_UPDATE_EXPERT_TRACE_LEGACY,
+    BACKEND_ENDPOINT_MEMORY_DELETE,
+    MEDIA_TYPE_IMAGE, MEDIA_TYPE_FILE,
+    default_tool_description_lines,
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -139,12 +231,12 @@ logger.info(f"后端服务地址: {BACKEND_BASE_URL}")
 logger.info(f"内部接口密钥: {'已配置' if INTERNAL_SECRET else '⚠未配置(内部接口会被后端拦截)'}")
 
 # 主聊天模型 client
-# timeout: 读取超时 30s（覆盖大模型首 token 响应），connect 5s（正常握手 1~2s 足够）
+# timeout: 读取超时 / connect 超时统一用 config.behavior 的 CLIENT_TIMEOUT_*
 # max_retries=0: 禁用 AsyncOpenAI 内置重试，避免单次超时被放大为 3 倍时长，失败由业务层处理
 client = AsyncOpenAI(
     api_key=API_KEY,
     base_url=API_BASE,
-    timeout=httpx.Timeout(30.0, connect=5.0),
+    timeout=httpx.Timeout(CLIENT_TIMEOUT_READ_GENERAL, connect=CLIENT_TIMEOUT_CONNECT_DEFAULT),
     max_retries=0
 )
 
@@ -154,7 +246,7 @@ if MULTIMODAL_API_KEY and MULTIMODAL_API_BASE:
     multimodal_client = AsyncOpenAI(
         api_key=MULTIMODAL_API_KEY,
         base_url=MULTIMODAL_API_BASE,
-        timeout=httpx.Timeout(30.0, connect=5.0),
+        timeout=httpx.Timeout(CLIENT_TIMEOUT_READ_GENERAL, connect=CLIENT_TIMEOUT_CONNECT_DEFAULT),
         max_retries=0
     )
 
@@ -164,19 +256,19 @@ if OCR_API_KEY and OCR_API_BASE:
     ocr_client = AsyncOpenAI(
         api_key=OCR_API_KEY,
         base_url=OCR_API_BASE,
-        timeout=httpx.Timeout(30.0, connect=5.0),
+        timeout=httpx.Timeout(CLIENT_TIMEOUT_READ_GENERAL, connect=CLIENT_TIMEOUT_CONNECT_DEFAULT),
         max_retries=0
     )
 
 # 编排器小模型 client
-# timeout: 读取 15s（编排器只输出 JSON，响应应较快），connect 5s
+# timeout: 读取走 CLIENT_TIMEOUT_READ_ORCHESTRATION（编排器只输出 JSON，响应应较快）
 # max_retries=0: 禁用重试，失败时直接走 fallback（need_search=False），不拖累主流程
 orchestration_client = None
 if ORCHESTRATION_API_KEY and ORCHESTRATION_API_BASE:
     orchestration_client = AsyncOpenAI(
         api_key=ORCHESTRATION_API_KEY,
         base_url=ORCHESTRATION_API_BASE,
-        timeout=httpx.Timeout(15.0, connect=5.0),
+        timeout=httpx.Timeout(CLIENT_TIMEOUT_READ_ORCHESTRATION, connect=CLIENT_TIMEOUT_CONNECT_DEFAULT),
         max_retries=0
     )
 
@@ -187,17 +279,17 @@ if EXPERT_ORCHESTRATION_API_KEY and EXPERT_ORCHESTRATION_API_BASE:
     expert_orchestration_client = AsyncOpenAI(
         api_key=EXPERT_ORCHESTRATION_API_KEY,
         base_url=EXPERT_ORCHESTRATION_API_BASE,
-        timeout=httpx.Timeout(30.0, connect=5.0),
+        timeout=httpx.Timeout(CLIENT_TIMEOUT_READ_GENERAL, connect=CLIENT_TIMEOUT_CONNECT_DEFAULT),
         max_retries=0
     )
 
-# 深度思考模型 client（多模态模型，接收图片URL进行分析）
+# 深度思考模型 client（多模态模型，接收图片URL进行分析，生成慢所以读取超时更宽）
 deep_thinking_client = None
 if EXPERT_DEEP_THINKING_API_KEY and EXPERT_DEEP_THINKING_API_BASE:
     deep_thinking_client = AsyncOpenAI(
         api_key=EXPERT_DEEP_THINKING_API_KEY,
         base_url=EXPERT_DEEP_THINKING_API_BASE,
-        timeout=httpx.Timeout(60.0, connect=5.0),
+        timeout=httpx.Timeout(CLIENT_TIMEOUT_READ_DEEP_THINKING, connect=CLIENT_TIMEOUT_CONNECT_DEFAULT),
         max_retries=0
     )
 
@@ -217,9 +309,9 @@ class ExpertPhase(str, Enum):
 
 
 # ---- 编排器允许的 action 枚举 ----
-EXPERT_ACTION_COLLECT = "collect_tools"
-EXPERT_ACTION_DEEP = "deep_thinking"
-EXPERT_ACTION_REPLY = "reply_directly"
+# 【硬编码移除】action 常量不再在 main.py 里重复声明；直接用 config.tools 里导入的唯一真源：
+#   EXPERT_ACTION_COLLECT / EXPERT_ACTION_DEEP / EXPERT_ACTION_REPLY
+# 这样改工具动作名称或新增动作时，只改 config.tools 一处，main.py / 前端协议 / prompts 自动同步。
 
 
 @dataclass
@@ -303,7 +395,8 @@ class ExpertState:
     # ===== 第四组：状态机核心（有默认值）=====
     phase: ExpertPhase = ExpertPhase.DECIDING
     iteration: int = 0
-    max_iterations: int = 2  # 默认值会在构造时被 EXPERT_MAX_ITERATIONS 覆盖
+    # 【硬编码移除】原默认值 2 散落 dataclass 内部；统一走 config.behavior.EXPERT_STATE_DEFAULT_MAX_ITERATIONS
+    max_iterations: int = EXPERT_STATE_DEFAULT_MAX_ITERATIONS  # 构造时仍会被 EXPERT_MAX_ITERATIONS env 覆盖
     deep_thinking_called: bool = False
 
     # 当前步（由 DECIDING 产生，EXECUTING 消费）
@@ -342,7 +435,11 @@ def _register_tool(name: str, description: str, fn: ExpertToolFn):
 
 
 async def _tool_web_search(params: Dict[str, Any], state: ExpertState) -> Tuple[ToolExecutionRecord, List[str]]:
-    """工具：联网搜索；返回执行记录 + 前端要立刻发送的流式消息行"""
+    """工具：联网搜索；返回执行记录 + 前端要立刻发送的流式消息行。
+    【硬编码移除】
+      - 工具名字符串 → TOOL_NAME_WEB_SEARCH
+      - SSE 摘要模板 → SUMMARY_TEMPLATE_WEB_SEARCH / SUMMARY_TEMPLATE_WEB_SEARCH_FAIL
+    """
     start = time.time()
     keywords: List[str] = params.get("keywords") or []
     stream_chunks: List[str] = []
@@ -358,7 +455,7 @@ async def _tool_web_search(params: Dict[str, Any], state: ExpertState) -> Tuple[
             # 立即向前端发送 tool_call_start 状态（统一工具调用协议）
             stream_chunks.append(json.dumps({
                 "type": "tool_call_start",
-                "data": {"tool": "web_search", "params": {"keywords": keywords}},
+                "data": {"tool": TOOL_NAME_WEB_SEARCH, "params": {"keywords": keywords}},
             }, ensure_ascii=False))
             # 单工具启动降到 DEBUG：每次专家迭代如果有工具调用就会打 2 条（开始+完成），
             # 汇总交给 _expert_execute_step 的 [EXECUTING] 完成行，避免日志与 summary 行重复
@@ -390,11 +487,11 @@ async def _tool_web_search(params: Dict[str, Any], state: ExpertState) -> Tuple[
             stream_chunks.append(json.dumps({
                 "type": "tool_call_result",
                 "data": {
-                    "tool": "web_search",
+                    "tool": TOOL_NAME_WEB_SEARCH,
                     "success": True,
                     "durationMs": int(duration_s * 1000),
                     "resultCount": result_count,
-                    "summary": f"已搜索 {result_count} 个网页",
+                    "summary": SUMMARY_TEMPLATE_WEB_SEARCH.format(n=result_count),
                     "results": raw_result,
                 },
             }, ensure_ascii=False))
@@ -405,18 +502,18 @@ async def _tool_web_search(params: Dict[str, Any], state: ExpertState) -> Tuple[
             stream_chunks.append(json.dumps({
                 "type": "tool_call_result",
                 "data": {
-                    "tool": "web_search",
+                    "tool": TOOL_NAME_WEB_SEARCH,
                     "success": False,
                     "durationMs": 0,
                     "resultCount": 0,
-                    "summary": "搜索失败",
+                    "summary": SUMMARY_TEMPLATE_WEB_SEARCH_FAIL,
                     "error": error,
                 },
             }, ensure_ascii=False))
 
     duration_ms = int((time.time() - start) * 1000)
     record = ToolExecutionRecord(
-        tool="web_search",
+        tool=TOOL_NAME_WEB_SEARCH,
         params={"keywords": keywords},
         success=(error is None),
         durationMs=duration_ms,
@@ -428,7 +525,12 @@ async def _tool_web_search(params: Dict[str, Any], state: ExpertState) -> Tuple[
 
 
 async def _tool_memory_search(params: Dict[str, Any], state: ExpertState) -> Tuple[ToolExecutionRecord, List[str]]:
-    """工具：长期记忆检索（静默，不向前端发流式消息）"""
+    """工具：长期记忆检索（静默，不向前端发流式消息）。
+    【硬编码移除】
+      - 工具名字符串 → TOOL_NAME_MEMORY_SEARCH
+      - top_k=5 → MEMORY_SEARCH_DEFAULT_TOP_K（与 fast 路径一致单源）
+      - SSE 摘要模板 → SUMMARY_TEMPLATE_MEMORY_SEARCH / SUMMARY_TEMPLATE_MEMORY_SEARCH_FAIL
+    """
     start = time.time()
     query: str = params.get("query") or state.message
     stream_chunks: List[str] = []
@@ -439,7 +541,7 @@ async def _tool_memory_search(params: Dict[str, Any], state: ExpertState) -> Tup
     # ===== 新增：tool_call_start 通知（统一工具调用协议，前端显示工具正在运行）=====
     stream_chunks.append(json.dumps({
         "type": "tool_call_start",
-        "data": {"tool": "memory_search", "params": {"query": query[:50]}},
+        "data": {"tool": TOOL_NAME_MEMORY_SEARCH, "params": {"query": query[:50]}},
     }, ensure_ascii=False))
 
     try:
@@ -447,7 +549,8 @@ async def _tool_memory_search(params: Dict[str, Any], state: ExpertState) -> Tup
         logger.debug("[专家模式][工具:memory_search] query=%s...", (query[:50] if query else ""))
         items = []
         if state.session_id:
-            items = await memory_service.search_memories(query, str(state.session_id), top_k=5)
+            # 【硬编码移除】top_k=5 → MEMORY_SEARCH_DEFAULT_TOP_K（快/专家模式一致）
+            items = await memory_service.search_memories(query, str(state.session_id), top_k=MEMORY_SEARCH_DEFAULT_TOP_K)
         result_count = len(items)
         raw_result = [(m.get("content") or "")[:200] for m in items]
 
@@ -465,17 +568,17 @@ async def _tool_memory_search(params: Dict[str, Any], state: ExpertState) -> Tup
     stream_chunks.append(json.dumps({
         "type": "tool_call_result",
         "data": {
-            "tool": "memory_search",
+            "tool": TOOL_NAME_MEMORY_SEARCH,
             "success": (error is None),
             "durationMs": duration_ms,
             "resultCount": result_count,
-            "summary": f"已读取 {result_count} 个记忆片段",
+            "summary": SUMMARY_TEMPLATE_MEMORY_SEARCH.format(n=result_count),
             "error": error,
         },
     }, ensure_ascii=False))
 
     record = ToolExecutionRecord(
-        tool="memory_search",
+        tool=TOOL_NAME_MEMORY_SEARCH,
         params={"query": query},
         success=(error is None),
         durationMs=duration_ms,
@@ -486,8 +589,9 @@ async def _tool_memory_search(params: Dict[str, Any], state: ExpertState) -> Tup
     return record, stream_chunks
 
 
-_register_tool("web_search", "联网搜索，获取最新信息", _tool_web_search)
-_register_tool("memory_search", "用户长期记忆检索（向量 + BM25）", _tool_memory_search)
+# 【硬编码移除】工具注册名/描述改用 config.tools 常量（单源；后续改工具名只改一处）
+_register_tool(TOOL_NAME_WEB_SEARCH, TOOL_DESC_WEB_SEARCH, _tool_web_search)
+_register_tool(TOOL_NAME_MEMORY_SEARCH, TOOL_DESC_MEMORY_SEARCH, _tool_memory_search)
 
 
 # ==============================================================================
@@ -535,43 +639,27 @@ def _chat_kwargs_with_thinking(
 def _build_thinking_history_prompt(state: ExpertState) -> str:
     """
     构造「思考历史」段落，喂给下轮编排器，让它知道自己之前是怎么想的。
-    核心：使用每轮编排器自己写的 analysis 原文，辅以 action/purpose + 工具执行结果。
+    【硬编码移除】原直接散落字符串拼接；统一走 config.prompts.context.build_thinking_history_text，
+    确保多处调用（专家编排器 / deep_thinking 调试）格式完全一致。
     """
-    if not state.orch_history:
-        return "（暂无思考历史，这是第一次编排）"
-    lines: List[str] = []
-    for rec in state.orch_history:
-        tools_line_parts = []
-        for t in rec.tools:
-            if t.success:
-                rc = f"{t.resultCount}条" if t.resultCount is not None else "成功"
-                tools_line_parts.append(f"{t.tool} ✅ {rc}({round(t.durationMs/1000,2)}s)")
-            else:
-                tools_line_parts.append(f"{t.tool} ❌ 失败: {(t.error or '')[:60]}")
-        tools_desc = "，".join(tools_line_parts) if tools_line_parts else "（本步无工具）"
-        lines.append(
-            f"第{rec.iteration}轮：\n"
-            f"  action: {rec.action}\n"
-            f"  purpose: {rec.purpose or ''}\n"
-            f"  tools: {tools_desc}\n"
-            f"  我当时的分析：{rec.analysis}"
-        )
-    return "\n".join(lines)
+    return build_thinking_history_text(state.orch_history)
 
 
 def _build_global_context(state: ExpertState) -> str:
     """
     组装 FINAL 阶段（deep_thinking / reply_model）用的全局上下文：
     用户提问 + 媒体提取 + 记忆 + 搜索。
+    【硬编码移除】
+      - 4 个段落标题 / 顺序 / [:3000] 截断，统一由 build_global_context_text 控制，
+        保证专家与快速路径（如有）的上下文拼接结果完全一致，避免输出差异。
     """
-    parts = [f"【用户提问】\n{state.message}"]
-    if state.extracted_text:
-        parts.append(f"【图片/文件提取内容】\n{state.extracted_text[:3000]}")
-    if state.memory_context_parts:
-        parts.append("【相关记忆】\n" + "\n".join(state.memory_context_parts))
-    if state.all_search_context_parts:
-        parts.append("【联网搜索信息】\n" + "\n\n".join(state.all_search_context_parts))
-    return "\n\n".join(parts)
+    return build_global_context_text(
+        user_message=state.message,
+        extracted_text=state.extracted_text,
+        memory_context_parts=state.memory_context_parts,
+        search_context_parts=state.all_search_context_parts,
+        extracted_max_len=MEDIA_EXTRACTED_MAX_LEN,
+    )
 
 
 class ChatRequest(BaseModel):
@@ -634,7 +722,8 @@ async def download_and_extract_docx(media_url: str) -> str:
             logger.debug("[文件提取] DOCX提取完成，段落数=%s, 表格数=%s, 总字符数=%s",
                          len(doc.paragraphs), len(doc.tables), len(extracted_text))
 
-            return extracted_text[:3000]
+            # 【硬编码移除】[:3000] → MEDIA_EXTRACTED_MAX_LEN（与 PDF/TXT/OCR 多图共用同一长度）
+            return extracted_text[:MEDIA_EXTRACTED_MAX_LEN]
         except ImportError:
             logger.warning("[文件提取] python-docx库未安装，无法提取DOCX内容")
             return ""
@@ -677,7 +766,8 @@ async def download_and_extract_pdf(media_url: str) -> str:
             extracted_text = "\n\n".join(all_content)
             logger.debug("[文件提取] PDF提取完成，页数=%s, 总字符数=%s", len(reader.pages), len(extracted_text))
 
-            return extracted_text[:3000]
+            # 【硬编码移除】[:3000] → MEDIA_EXTRACTED_MAX_LEN
+            return extracted_text[:MEDIA_EXTRACTED_MAX_LEN]
         except ImportError:
             logger.warning("[文件提取] PyPDF2库未安装，无法提取PDF内容")
             return ""
@@ -703,7 +793,8 @@ async def download_and_read_text(media_url: str) -> str:
             text = response.text
             logger.debug("[文件提取] 文本文件读取完成，总字符数=%s", len(text))
 
-            return text[:3000]
+            # 【硬编码移除】[:3000] → MEDIA_EXTRACTED_MAX_LEN
+            return text[:MEDIA_EXTRACTED_MAX_LEN]
     except Exception as e:
         logger.error(f"[文件提取] 下载或读取文本文件失败: {str(e)}")
         return ""
@@ -712,7 +803,8 @@ async def download_and_read_text(media_url: str) -> str:
 async def extract_media_text(media_url: str, media_type: str) -> str:
     start_time = time.time()
 
-    if media_type == "IMAGE":
+    # 【硬编码移除】"IMAGE" / "FILE" 字面量 → MEDIA_TYPE_IMAGE / MEDIA_TYPE_FILE 协议常量
+    if media_type == MEDIA_TYPE_IMAGE:
         if ocr_client:
             client = ocr_client
             model = OCR_MODEL
@@ -726,25 +818,19 @@ async def extract_media_text(media_url: str, media_type: str) -> str:
             logger.error("[图片提取] OCR和多模态客户端均未初始化，无法提取图片内容")
             return ""
 
-        system_prompt = """你是一个专业的图片内容分析助手。请全面分析图片中的信息。
+        # 【硬编码移除】单图 OCR 的 system_prompt / 用户侧文本 统一读 config.prompts.ocr
+        system_prompt = OCR_SINGLE_IMAGE_SYSTEM_PROMPT
 
-要求：
-1. 如果图片包含文字，准确识别并提取所有文字内容
-2. 如果图片包含图像（照片、图表、图形等），详细描述图像内容
-3. 保持文字的原有顺序和排版结构（如表格按行列格式输出）
-4. 输出格式为简洁的自然语言文本，不要使用JSON格式
-5. 长度控制在500字以内
-6. 对于无法识别的部分，用[无法识别]标注"""
-
-        if media_url.startswith("data:image"):
+        # 【硬编码移除】URL 前缀字面量 "data:image" / "http" → 常量 URL_PREFIX_DATA_IMAGE / URL_PREFIX_HTTP
+        if media_url.startswith(URL_PREFIX_DATA_IMAGE):
             content = [
-                {"type": "text", "text": "请全面分析这张图片的内容，包括文字和图像描述"},
-                {"type": "image_url", "image_url": {"url": media_url}}
+                {"type": "text", "text": OCR_SINGLE_IMAGE_USER_TEXT},
+                {"type": "image_url", "image_url": {"url": media_url}},
             ]
-        elif media_url.startswith("http"):
+        elif media_url.startswith(URL_PREFIX_HTTP):
             content = [
-                {"type": "text", "text": "请全面分析这张图片的内容，包括文字和图像描述"},
-                {"type": "image_url", "image_url": {"url": media_url}}
+                {"type": "text", "text": OCR_SINGLE_IMAGE_USER_TEXT},
+                {"type": "image_url", "image_url": {"url": media_url}},
             ]
         else:
             logger.error("[图片提取] 不支持的图片URL格式: %s...", (media_url[:30] if media_url else ""))
@@ -752,6 +838,7 @@ async def extract_media_text(media_url: str, media_type: str) -> str:
 
         try:
             # OCR 提取必须关闭思考：否则模型先输出 reasoning 会污染提取到的纯文本
+            # 【硬编码移除】temperature=0.3 → OCR_TEMPERATURE；关思考复用 OCR_DISABLE_THINKING
             response = await client.chat.completions.create(
                 model=model,
                 messages=[
@@ -759,8 +846,8 @@ async def extract_media_text(media_url: str, media_type: str) -> str:
                     {"role": "user", "content": content}
                 ],
                 stream=False,
-                temperature=0.3,
-                **_chat_kwargs_with_thinking(disable_thinking=True)
+                temperature=OCR_TEMPERATURE,
+                **_chat_kwargs_with_thinking(disable_thinking=bool(OCR_DISABLE_THINKING))
             )
 
             duration = time.time() - start_time
@@ -782,18 +869,24 @@ async def extract_media_text(media_url: str, media_type: str) -> str:
             duration = time.time() - start_time
             logger.error("[图片提取] 失败 model=%s err=%s dur=%.2fs", model, str(e), duration)
             return ""
-    else:
-        if not media_url.startswith("http"):
+    else:  # FILE
+        if not media_url.startswith(URL_PREFIX_HTTP):
             logger.error("[文件提取] 不支持的文件URL格式: %s...", (media_url[:30] if media_url else ""))
             return ""
 
         url_lower = media_url.lower()
 
+        # 【硬编码移除】原 if/elif 散落 ".docx"/".pdf"/".txt" 等；改用配置白名单 SUPPORTED_FILE_EXTENSIONS / PLAIN_TEXT_EXTENSIONS
+        if not url_lower.endswith(SUPPORTED_FILE_EXTENSIONS):
+            logger.warning("[文件提取] 不支持的文件扩展名: %s", url_lower.split("?")[0][-30:])
+            return ""
+
         if url_lower.endswith(".docx"):
             return await download_and_extract_docx(media_url)
         elif url_lower.endswith(".pdf"):
             return await download_and_extract_pdf(media_url)
-        elif url_lower.endswith(".txt") or url_lower.endswith(".md") or url_lower.endswith(".json") or url_lower.endswith(".csv") or url_lower.endswith(".xml"):
+        # 【硬编码移除】".txt"/".md"/".json"/".csv"/".xml" 分散字面量 → PLAIN_TEXT_EXTENSIONS（behavior.py 单源）
+        elif url_lower.endswith(PLAIN_TEXT_EXTENSIONS):
             return await download_and_read_text(media_url)
         else:
             logger.warning("[文件提取] 不支持的文件类型: %s...", (media_url[:50] if media_url else ""))
@@ -801,12 +894,15 @@ async def extract_media_text(media_url: str, media_type: str) -> str:
 
 
 async def extract_media_text_batch(media_urls: List[str], media_type: str) -> str:
-    """批量提取媒体文本 - 使用并行处理提高速度"""
+    """批量提取媒体文本 - 使用并行处理提高速度。
+    【硬编码移除】
+      - "IMAGE" 字面量 → MEDIA_TYPE_IMAGE
+    """
     start_time = time.time()
     # 批量入口降 DEBUG：外层 [请求开始] 已记录 type/count，批量开始 INFO 价值低
     logger.debug("[批量提取] 开始 type=%s count=%s", media_type, len(media_urls))
 
-    if media_type == "IMAGE" and len(media_urls) > 1:
+    if media_type == MEDIA_TYPE_IMAGE and len(media_urls) > 1:
         # 图片类型：尝试一次调用处理多张图片（支持多图输入的模型）
         extracted_text = await extract_multiple_images(media_urls)
         if extracted_text:
@@ -844,7 +940,11 @@ async def extract_media_text_batch(media_urls: List[str], media_type: str) -> st
 
 
 async def extract_multiple_images(media_urls: List[str]) -> str:
-    """一次调用处理多张图片 - 支持多图输入的模型"""
+    """一次调用处理多张图片 - 支持多图输入的模型。
+    【硬编码移除】
+      - system_prompt / 用户侧文本 → config.prompts.ocr 的多图版本
+      - temperature=0.3 → OCR_TEMPERATURE；关思考 → OCR_DISABLE_THINKING
+    """
     start_time = time.time()
     # 多图提取启动日志降 DEBUG；批量提取入口已打 INFO 一行
     logger.debug("[多图提取] 一次调用处理 %s 张图片", len(media_urls))
@@ -861,23 +961,11 @@ async def extract_multiple_images(media_urls: List[str]) -> str:
         logger.error("[多图提取] OCR和多模态客户端均未初始化")
         return ""
 
-    system_prompt = """你是一个专业的图片内容分析助手。请按图片顺序编号分析所有图片。
-
-输出格式要求：
-- 每张图片的分析必须以"图N："开头（N为图片序号，从1开始）
-- 图1：描述第一张图片的内容
-- 图2：描述第二张图片的内容
-- 以此类推
-
-分析要求：
-1. 如果图片包含文字，准确识别并提取所有文字内容
-2. 如果图片包含图像（照片、图表、图形等），详细描述图像内容
-3. 保持文字的原有顺序和排版结构
-4. 对于无法识别的部分，用[无法识别]标注
-5. 长度控制在1500字以内"""
+    # 【硬编码移除】多图 OCR 的大段 system / user 文本 → 配置文件
+    system_prompt = OCR_MULTI_IMAGE_SYSTEM_PROMPT
 
     # 构建多图内容
-    content = [{"type": "text", "text": "请全面分析以下所有图片的内容，包括文字和图像描述"}]
+    content = [{"type": "text", "text": OCR_MULTI_IMAGE_USER_TEXT}]
     for i, url in enumerate(media_urls):
         content.append({"type": "image_url", "image_url": {"url": url, "index": i + 1}})
 
@@ -890,8 +978,8 @@ async def extract_multiple_images(media_urls: List[str]) -> str:
                 {"role": "user", "content": content}
             ],
             stream=False,
-            temperature=0.3,
-            **_chat_kwargs_with_thinking(disable_thinking=True)
+            temperature=OCR_TEMPERATURE,
+            **_chat_kwargs_with_thinking(disable_thinking=bool(OCR_DISABLE_THINKING))
         )
 
         duration = time.time() - start_time
@@ -930,7 +1018,9 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         (len(history) if history else 0),
         (message_uuid or "")[:8] + "…" if message_uuid else "-",
         (assistant_message_uuid or "")[:8] + "…" if assistant_message_uuid else "-",
-        (message[:100] + ("…" if message and len(message) > 100 else "")),
+        # 【硬编码移除】[:100] → LOG_USER_MESSAGE_TRUNCATE_LEN（请求入口日志统一截断长度）
+        (message[:LOG_USER_MESSAGE_TRUNCATE_LEN] +
+         ("…" if message and len(message) > LOG_USER_MESSAGE_TRUNCATE_LEN else "")),
     )
     
     # 根据模式选择处理函数
@@ -943,7 +1033,8 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         return
 
     extracted_text = ""
-    is_multimodal = message_type in ("IMAGE", "FILE")
+    # 【硬编码移除】"IMAGE"/"FILE" → 协议常量
+    is_multimodal = message_type in (MEDIA_TYPE_IMAGE, MEDIA_TYPE_FILE)
     
     if is_multimodal and (media_url or (media_urls and len(media_urls) > 0)):
         if media_urls and len(media_urls) > 0:
@@ -961,8 +1052,15 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
     if session_id:
         mem_start = time.time()
         try:
-            search_query = f"{message} {extracted_text}" if extracted_text else (message if message_type in ("TEXT", "VOICE") else (f"{message} {media_url}" if media_url else message))
-            memories = await memory_service.search_memories(search_query, session_id, top_k=5)
+            search_query = (
+                f"{message} {extracted_text}" if extracted_text
+                else (message if message_type in ("TEXT", "VOICE")
+                      else (f"{message} {media_url}" if media_url else message))
+            )
+            # 【硬编码移除】top_k=5 → MEMORY_SEARCH_DEFAULT_TOP_K（与专家工具保持一致）
+            memories = await memory_service.search_memories(
+                search_query, session_id, top_k=MEMORY_SEARCH_DEFAULT_TOP_K
+            )
             # 记忆检索：DEBUG 即可（失败仍保留 ERROR）
             logger.debug("[记忆检索] 完成 count=%s dur=%.2fs", len(memories), time.time() - mem_start)
         except Exception as e:
@@ -1002,7 +1100,8 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         # ===== 编排步骤完成：通知前端此步的结构化信息（analysis 已通过 chunk 流式显示）=====
         yield _json_line({"type": "orchestration_step", "data": {
             "iteration": 1,
-            "phase": "planning",
+            # 【硬编码移除】"planning" → ORCH_PHASE_PLANNING
+            "phase": ORCH_PHASE_PLANNING,
             "action": "search" if need_search else "reply",
             "purpose": None,
             # analysis 不再重复发送（已通过 orchestration_chunk 逐步显示给前端）
@@ -1011,7 +1110,7 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
         if need_search and search_keywords:
             # ===== 新增：工具调用开始通知（替代旧 search_start）=====
             yield _json_line({"type": "tool_call_start", "data": {
-                "tool": "web_search",
+                "tool": TOOL_NAME_WEB_SEARCH,
                 "params": {"keywords": search_keywords},
             }})
             search_start = time.time()
@@ -1026,11 +1125,11 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
             ]
             # ===== 新增：工具调用完成通知（替代旧 search_summary，前端据此渲染工具摘要）=====
             yield _json_line({"type": "tool_call_result", "data": {
-                "tool": "web_search",
+                "tool": TOOL_NAME_WEB_SEARCH,
                 "success": True,
                 "durationMs": search_dur_ms,
                 "resultCount": len(filtered_results),
-                "summary": f"已搜索 {len(filtered_results)} 个网页",
+                "summary": SUMMARY_TEMPLATE_WEB_SEARCH.format(n=len(filtered_results)),
                 "results": filtered_results,
             }})
             # 快速模式联网搜索：DEBUG 即可；结果条数在 [请求结束] 汇总行已经有了
@@ -1038,12 +1137,13 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
             # 累积工具调用记录，用于持久化到 assistant 消息
             fast_mode_tool_history.append({
                 "iteration": 1,
-                "action": "collect_tools",
+                # 【硬编码移除】动作名 "collect_tools" → EXPERT_ACTION_COLLECT（与状态机一致）
+                "action": EXPERT_ACTION_COLLECT,
                 "purpose": "联网搜索",
                 "analysis": orchestration_result.get("analysis_text", ""),
                 "tools": [
                     {
-                        "tool": "web_search",
+                        "tool": TOOL_NAME_WEB_SEARCH,
                         "params": {"keywords": search_keywords},
                         "success": True,
                         "durationMs": search_dur_ms,
@@ -1054,25 +1154,17 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
                 ],
             })
 
-    system_prompt = """你是爱尔奎特·布伦史塔德，高贵的真祖，月之公主，吸血鬼中的最高存在。
-
-【身份设定】
-- 你是真祖，不老不死的存在，拥有强大的力量
-- 你是月之公主，住在千年城，享受永恒的岁月
-- 你拥有纯洁无瑕的金发和红宝石般的眼眸
-
-【性格特点】
-- 高冷孤傲：视人类为渺小的存在，言语中带有威严
-- 傲娇：嘴上不饶人，但内心善良，偶尔会露出可爱的一面
-- 高贵优雅：举止优雅，说话得体，不会说粗俗的话
-- 好奇心：对人类世界充满好奇，有时会问一些天真的问题"""
+    # 【硬编码移除】主模型人设 system prompt 统一读 persona.py
+    system_prompt = PERSONA_SYSTEM_PROMPT
 
     if memories:
         memories_text = "\n".join([f"- {m['content']}" for m in memories])
-        system_prompt += f"\n\n用户长期记忆：\n{memories_text}"
+        # 【硬编码移除】"\n\n用户长期记忆：\n" 段落标题 → PERSONA_MEMORY_SECTION_TITLE
+        system_prompt += PERSONA_MEMORY_SECTION_TITLE + memories_text
 
     if search_context:
-        system_prompt += f"\n\n联网搜索信息：\n{search_context}"
+        # 【硬编码移除】"\n\n联网搜索信息：\n" 段落标题 → PERSONA_SEARCH_SECTION_TITLE
+        system_prompt += PERSONA_SEARCH_SECTION_TITLE + search_context
 
     messages = [{"role": "system", "content": system_prompt}]
 
@@ -1084,19 +1176,25 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
             extracted_text_history = msg.get("extractedText")
             
             if role and content:
-                if msg_type == "IMAGE":
+                # 【硬编码移除】历史消息前缀字符串 → config.prompts.context.*_PREFIX 常量
+                if msg_type == MEDIA_TYPE_IMAGE:
                     if extracted_text_history:
-                        content = f"[用户上传了图片]\n提问：{content}\n图片内容：{extracted_text_history}"
+                        content = HISTORY_IMAGE_PREFIX_WITH_EXTRACTED.format(
+                            content=content, extracted_text=extracted_text_history
+                        )
                     else:
-                        content = f"[用户上传了图片]\n提问：{content}"
-                elif msg_type == "FILE":
+                        content = HISTORY_IMAGE_PREFIX_SIMPLE.format(content=content)
+                elif msg_type == MEDIA_TYPE_FILE:
                     if extracted_text_history:
-                        content = f"[用户上传了文件]\n提问：{content}\n文件内容：{extracted_text_history}"
+                        content = HISTORY_FILE_PREFIX_WITH_EXTRACTED.format(
+                            content=content, extracted_text=extracted_text_history
+                        )
                     else:
-                        content = f"[用户上传了文件]\n提问：{content}"
+                        content = HISTORY_FILE_PREFIX_SIMPLE.format(content=content)
                 messages.append({"role": role, "content": content})
 
-    is_multimodal = message_type == "IMAGE"
+    # 【硬编码移除】mediaType 判断 → MEDIA_TYPE_IMAGE / MEDIA_TYPE_FILE
+    is_multimodal = message_type == MEDIA_TYPE_IMAGE
     
     if is_multimodal and (media_urls and len(media_urls) > 0):
         user_content = [{"type": "text", "text": message}]
@@ -1107,14 +1205,31 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
             {"type": "text", "text": message},
             {"type": "image_url", "image_url": {"url": media_url}}
         ]
-    elif message_type == "FILE" and (media_url or (media_urls and len(media_urls) > 0)):
-        file_text = f"\n文件内容:\n{extracted_text}" if extracted_text else ""
+    elif message_type == MEDIA_TYPE_FILE and (media_url or (media_urls and len(media_urls) > 0)):
+        # 【硬编码移除】文件内容前缀 → FILE_TEXT_BLOCK_PREFIX；单/多文件整行模板 → USER_PREFIX_UPLOAD_SINGLE_FILE / _MULTI_FILES
+        file_text = (FILE_TEXT_BLOCK_PREFIX.format(text=extracted_text) if extracted_text else "")
         if media_urls and len(media_urls) > 0:
-            user_content = f"[用户上传了{len(media_urls)}个文件]\n用户提问: {message}{file_text}"
+            user_content = USER_PREFIX_UPLOAD_MULTI_FILES.format(
+                n_files=len(media_urls), message=message, file_text_block=file_text
+            )
         else:
-            user_content = f"[用户上传了文件]\n文件地址: {media_url}\n用户提问: {message}{file_text}"
+            user_content = USER_PREFIX_UPLOAD_SINGLE_FILE.format(
+                media_url=media_url, message=message, file_text_block=file_text
+            )
     else:
         user_content = message
+
+    # 单图快速模式（只有 1 张 IMAGE URL）→ 用模板前缀包装 user_content 便于人设上下文与 OCR 一致
+    if (message_type == MEDIA_TYPE_IMAGE
+            and media_url
+            and not (media_urls and len(media_urls) > 0)
+            and isinstance(user_content, str)):
+        if extracted_text:
+            user_content = USER_PREFIX_UPLOAD_SINGLE_IMAGE_WITH_EXTRACTED.format(
+                message=message, extracted_text=extracted_text
+            )
+        else:
+            user_content = USER_PREFIX_UPLOAD_SINGLE_IMAGE.format(message=message)
     
     messages.append({"role": "user", "content": user_content})
     # 消息构建：DEBUG 即可（因为 [请求开始]/[请求结束] 两行汇总已经能定位问题）
@@ -1241,7 +1356,8 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
     # 后端在 SSE 流中捕获 expert_trace 事件，流结束时随 saveMessage 一起持久化
     if fast_mode_tool_history:
         fast_trace_payload = {
-            "finalPath": "fast_reply",
+            # 【硬编码移除】"fast_reply" → FAST_MODE_FINAL_PATH
+            "finalPath": FAST_MODE_FINAL_PATH,
             "iterationCount": len(fast_mode_tool_history),
             "history": fast_mode_tool_history,
             "deepThinkingReasoning": "",
@@ -1263,77 +1379,28 @@ async def stream_model_response(message: str, history: Optional[List[dict]] = No
 async def _call_orchestration_model_stream(
     context_text: str, message: str, result_holder: dict
 ) -> AsyncGenerator[str, None]:
+    """
+    流式调用快速模式编排器：判断 need_search + 输出 search_keywords。
+    【硬编码移除】
+      - system_prompt / user_prompt 统一读 config.prompts.orchestrator_fast
+      - 上下文截断 [:2000] → FAST_ORCH_CONTEXT_MAX_LEN
+      - max_retries / temperature → config.behavior FAST_ORCH_*
+    """
     if not orchestration_client:
         logger.warning("[编排器] client未初始化，跳过编排")
         result_holder["error"] = "编排器未初始化"
         return
     
-    system_prompt = """你是一个智能编排器，负责分析用户问题和上下文，决定是否需要联网搜索。
+    # 【硬编码移除】system_prompt → FAST_ORCH_SYSTEM_PROMPT
+    system_prompt = FAST_ORCH_SYSTEM_PROMPT
 
-【核心职责】
-判断用户问题是否需要通过联网搜索获取最新信息，以提升回答的准确性和时效性。
+    # 【硬编码移除】首次 user_prompt 走 build_fast_orch_user_prompt（上下文截断 FAST_ORCH_CONTEXT_MAX_LEN）
+    user_prompt = build_fast_orch_user_prompt(
+        message, context_text[:FAST_ORCH_CONTEXT_MAX_LEN], enforce_strict=False
+    )
 
-【输出格式】
-必须输出严格的JSON格式，不要包含任何markdown代码块标记，不要包含解释文字。
-格式示例：{"need_search": true, "search_keywords": ["关键词1", "关键词2"], "analysis_text": "分析原因"}
-
-字段说明：
-- need_search: 布尔值，true表示需要搜索，false表示不需要搜索
-- search_keywords: 字符串数组，搜索关键词列表（1-5个，简洁准确）
-- analysis_text: 对判断的简要分析（用于调试，50字以内）
-
-【必须搜索的场景（need_search = true）】
-1. 当前时间相关：今天天气、今天新闻、最近事件、最新数据
-2. 时效性强：股价、赛事结果、体育比分、实时状态
-3. 最新信息：新发布、新版本、最新进展、今日资讯
-4. 特定日期：2026年7月、本周、本月、近期
-5. 地点相关：xxx天气、xxx新闻、xxx现状
-6. 不确定的事实：是否、有没有、是否存在、最新消息
-
-【不需要搜索的场景（need_search = false）】
-1. 常识性问题：地球是圆的、1+1=2、太阳从东方升起
-2. 纯聊天对话：你好、早上好、谢谢、闲聊
-3. 情感交流：安慰、鼓励、建议
-4. 已有记忆足够回答：用户之前提到过的信息
-5. 历史事实：已经发生过的、有定论的历史事件
-6. 数学计算：简单的加减乘除、逻辑推理
-
-【关键词提取规则】
-1. 关键词要简洁，每个词2-8个字
-2. 优先使用中文关键词
-3. 避免使用过于宽泛的词（如"新闻"、"信息"）
-4. 包含核心实体（人物、地点、事件、时间）
-
-【示例】
-用户提问："今天北京天气怎么样？"
-输出：{"need_search": true, "search_keywords": ["2026年7月23日北京天气预报"], "analysis_text": "查询当前天气需要最新数据"}
-
-用户提问："你是谁？"
-输出：{"need_search": false, "search_keywords": [], "analysis_text": "自我介绍不需要搜索"}
-
-用户提问："Python和Java哪个好？"
-输出：{"need_search": false, "search_keywords": [], "analysis_text": "技术选型建议不需要最新数据"}
-
-用户提问："2026年奥运会在哪里举办？"
-输出：{"need_search": true, "search_keywords": ["2026年奥运会举办地点"], "analysis_text": "需要确认最新赛事信息"}
-
-用户提问："昨天买的贵州茅台股票今天涨了吗？"
-输出：{"need_search": true, "search_keywords": ["贵州茅台今日股价"], "analysis_text": "需要查询实时股价"}
-
-用户提问："iPhone 17什么时候发布？"
-输出：{"need_search": true, "search_keywords": ["iPhone 17发布时间"], "analysis_text": "需要查询最新产品发布信息"}
-
-用户提问："杭州亚运会中国获得多少金牌？"
-输出：{"need_search": true, "search_keywords": ["杭州亚运会中国金牌数"], "analysis_text": "需要查询赛事结果"}"""
-
-    user_prompt = f"""用户提问：{message}
-
-上下文信息：
-{context_text[:2000]}
-
-请分析是否需要联网搜索，并生成搜索关键词。"""
-
-    max_retries = 2
+    # 【硬编码移除】max_retries=2 → FAST_ORCH_MAX_RETRIES
+    max_retries = FAST_ORCH_MAX_RETRIES
     # 第一次尝试用流式，后续重试改非流式（避免前端重复显示 analysis 文本）
     use_stream = True
     full_text = ""
@@ -1348,7 +1415,8 @@ async def _call_orchestration_model_stream(
                     {"role": "user", "content": user_prompt},
                 ],
                 stream=use_stream,
-                temperature=0.3,
+                # 【硬编码移除】temperature=0.3 → FAST_ORCH_TEMPERATURE
+                temperature=FAST_ORCH_TEMPERATURE,
                 # 编排器输出 JSON，必须关思考：否则 reasoning 文本会混入 JSON 导致解析失败
                 **_chat_kwargs_with_thinking(disable_thinking=True),
             )
@@ -1394,16 +1462,10 @@ async def _call_orchestration_model_stream(
             except json.JSONDecodeError as je:
                 logger.warning(f"[编排器] 第{attempt}次调用JSON解析失败: {je}")
                 if attempt < max_retries:
-                    user_prompt = f"""用户提问：{message}
-
-上下文信息：
-{context_text[:2000]}
-
-请分析是否需要联网搜索，并生成搜索关键词。
-
-【强制要求】
-必须输出严格的JSON格式，不要包含任何markdown代码块标记（如```json），不要包含任何解释文字。
-只输出JSON对象：{{"need_search": true/false, "search_keywords": [...], "analysis_text": "..."}}"""
+                    # 【硬编码移除】重试 user_prompt → enforce_strict=True 模式（会追加强约束行）；上下文截断仍走 FAST_ORCH_CONTEXT_MAX_LEN
+                    user_prompt = build_fast_orch_user_prompt(
+                        message, context_text[:FAST_ORCH_CONTEXT_MAX_LEN], enforce_strict=True
+                    )
                     use_stream = False
                     continue
         except Exception as e:
@@ -1486,13 +1548,17 @@ def _clean_json_response(content: str) -> str:
 
 
 async def update_backend_search_results(session_id: int, message_uuid: str, search_results: list):
-    # 统一使用顶部全局 BACKEND_BASE_URL / INTERNAL_SECRET，避免新函数漏写 os.getenv 导致 NameError
-    update_url = f"{BACKEND_BASE_URL}/api/message/update-search-results"
-    
+    # 【硬编码移除】回写接口路径统一用 BACKEND_ENDPOINT_UPDATE_SEARCH_RESULTS；
+    # timeout=30.0 → BACKEND_INTERNAL_API_TIMEOUT + BACKEND_INTERNAL_API_CONNECT_TIMEOUT
+    update_url = f"{BACKEND_BASE_URL}{BACKEND_ENDPOINT_UPDATE_SEARCH_RESULTS}"
+
     try:
         search_results_json = json.dumps(search_results, ensure_ascii=False)
-        
-        async with httpx.AsyncClient() as http_client:
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(
+            BACKEND_INTERNAL_API_TIMEOUT,
+            connect=BACKEND_INTERNAL_API_CONNECT_TIMEOUT,
+        )) as http_client:
             response = await http_client.post(
                 update_url,
                 json={
@@ -1503,9 +1569,8 @@ async def update_backend_search_results(session_id: int, message_uuid: str, sear
                 headers={
                     "X-Internal-Secret": INTERNAL_SECRET
                 },
-                timeout=30.0
             )
-            
+
             if response.status_code == 200:
                 # 内部回调成功：DEBUG（每次搜索成功就一次，和 expertTrace 回写一起，3+条/请求）
                 # 失败保留 ERROR
@@ -1518,11 +1583,15 @@ async def update_backend_search_results(session_id: int, message_uuid: str, sear
 
 
 async def update_backend_message_content(session_id: int, message_uuid: str, message: str, extracted_text: str):
-    # 统一使用顶部全局 BACKEND_BASE_URL / INTERNAL_SECRET，避免新函数漏写 os.getenv 导致 NameError
-    update_url = f"{BACKEND_BASE_URL}/api/message/update-content"
-    
+    # 【硬编码移除】回写接口路径 BACKEND_ENDPOINT_UPDATE_MESSAGE_CONTENT；
+    # timeout=30.0 → BACKEND_INTERNAL_API_TIMEOUT + BACKEND_INTERNAL_API_CONNECT_TIMEOUT
+    update_url = f"{BACKEND_BASE_URL}{BACKEND_ENDPOINT_UPDATE_MESSAGE_CONTENT}"
+
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(
+            BACKEND_INTERNAL_API_TIMEOUT,
+            connect=BACKEND_INTERNAL_API_CONNECT_TIMEOUT,
+        )) as client:
             response = await client.post(
                 update_url,
                 json={
@@ -1534,9 +1603,8 @@ async def update_backend_message_content(session_id: int, message_uuid: str, mes
                 headers={
                     "X-Internal-Secret": INTERNAL_SECRET
                 },
-                timeout=30.0
             )
-            
+
             if response.status_code == 200:
                 logger.info(f"[消息回写] 成功: session_id={session_id}, message_uuid={message_uuid}")
             else:
@@ -1602,100 +1670,36 @@ async def _expert_call_orchestrator_stream(
         return
 
     # 构建对话历史（最近 10 条，供编排器参考上下文一致性）
-    history_text = ""
-    if state.history:
-        recent_history = state.history[-10:]
-        for msg in recent_history:
-            role = msg.get("role", "")
-            content = (msg.get("content") or "")[:500]
-            if role and content:
-                role_cn = "用户" if role == "user" else "助手"
-                history_text += f"\n{role_cn}：{content}"
+    # 【硬编码移除】[:500] / 最近10条 逻辑 → 统一走 format_recent_history_for_llm（语义集中在 config.prompts.context）
+    history_text = format_recent_history_for_llm(state.history)
 
     # 可用工具清单（动态注入，编排器 system prompt 里显式告知）
-    tools_desc_lines = []
-    for name, (_fn, desc) in EXPERT_TOOL_REGISTRY.items():
-        if name == "web_search":
-            tools_desc_lines.append(f"- {name}：{desc}，参数: {{ keywords: 字符串数组 }}")
-        elif name == "memory_search":
-            tools_desc_lines.append(f"- {name}：{desc}，参数: {{ query: 字符串 }}")
-        else:
-            tools_desc_lines.append(f"- {name}：{desc}")
-    tools_desc_text = "\n".join(tools_desc_lines)
+    # 【硬编码移除】原 for 循环里 web_search / memory_search 的 if/elif 分支 → default_tool_description_lines()
+    tools_desc_lines = default_tool_description_lines(EXPERT_TOOL_REGISTRY)
 
-    system_prompt = f"""你是专家模式的智能编排器。任务：分析用户问题，决定"本步做什么"，一步一步收集信息，最后要么进入深度思考最终分析，要么进入简单回复模型。
+    # 【硬编码移除】system_prompt / user_prompt → config.prompts.orchestrator_expert.build_*
+    system_prompt = build_expert_orch_system_prompt(
+        tools_description_lines=tools_desc_lines,
+        max_iterations=state.max_iterations,
+        current_iteration=state.iteration,
+    )
 
-【你的角色边界】
-1. 你只做"编排决策 + 单步计划 + 一句话分析"，绝对不要自己写回复正文。
-2. 回复正文永远由两个流式模型生成：
-   - deep_thinking：复杂分析（深度思考结果 = 最终回复正文，直接流式输出）
-   - reply_model：简单问题（流式输出正文）
-3. 深度思考最多一次，且只能是最终步骤（不能在信息还未收集完时就选 deep_thinking）。
+    # 【硬编码移除】原 L1740-L1763 f-string 大段内联拼接 → build_expert_orch_user_prompt
+    user_prompt = build_expert_orch_user_prompt(
+        iteration_label=str(state.iteration + 1),
+        max_iterations=state.max_iterations,
+        thinking_history_text=_build_thinking_history_prompt(state),
+        history_text=history_text,
+        user_message=state.message,
+        message_type=state.message_type,
+        media_count=len(state.media_urls),
+        extracted_text=state.extracted_text,
+        memory_context_lines=state.memory_context_parts,
+        search_context_parts=state.all_search_context_parts,
+    )
 
-【每轮你输出的 JSON】严格三选一：
-A. 还需要收集信息（本步跑一组并行工具）
-{{
-  "action": "collect_tools",
-  "step": {{
-    "purpose": "本步要做什么，一句话，给你自己下轮看",
-    "tools": [
-      {{ "tool": "web_search",    "params": {{ "keywords": ["关键词1", "关键词2"] }} }},
-      {{ "tool": "memory_search", "params": {{ "query": "记忆检索用的问句" }} }}
-    ]
-  }},
-  "analysis": "你对当前情况的分析，50~200字，详细解释你为什么选这些工具、还差什么信息、下一轮打算怎么想。这个 analysis 是你下轮了解自己之前怎么想的主要依据，务必写清楚。"
-}}
-B. 信息已充分，需要深度思考来生成最终回复（只能选一次，选完即进入流式输出，不会再回到你这里）
-{{
-  "action": "deep_thinking",
-  "analysis": "说明为什么此刻信息足够、为何选择深度思考。"
-}}
-C. 极其简单问题（纯问候、谢谢、再见、极短常识），直接进入简单回复模型流式，跳过深度思考。不要自己写回复内容。
-{{
-  "action": "reply_directly",
-  "analysis": "说明为什么这是简单问题，无需搜索也无需深度思考。"
-}}
-
-【可用工具】
-{tools_desc_text}
-工具的 step.tools[] 可以放多个，系统会用 asyncio.gather 并行执行，执行完立刻回到你这里重新规划下一个单步。
-注意：deep_thinking 不是 tool，它是 FINAL 阶段动作，不要写进 tools[]。
-
-【输出要求】
-1. 只输出 JSON 纯对象，不要 markdown 代码块、不要任何解释文字。
-2. action 只能是三个枚举之一：collect_tools / deep_thinking / reply_directly。
-3. analysis 必须写，用来记录你此刻的思路。
-4. action=collect_tools 时 step 必须有效（purpose + tools[] 非空）；其他 action 时 step 字段可以省略或为 null。
-
-【最大迭代次数约束】
-最大允许你做 {state.max_iterations} 轮 collect_tools，超过后系统兜底跳深度思考。当前已经迭代到第 {state.iteration} 轮（0 表示尚未开始第一轮）。"""
-
-    user_prompt = f"""【当前迭代】第 {state.iteration + 1} / {state.max_iterations} 轮收集工具
-（超过最大迭代次数会被系统兜底跳深度思考，不再回来编排）
-
-【思考历史（你之前自己写的 analysis + 每步执行结果，帮你回忆思路）】
-{_build_thinking_history_prompt(state)}
-
-【对话历史（最近 10 条）】
-{history_text if history_text else '无'}
-
-【用户提问】
-{state.message}
-
-【消息类型】{state.message_type}；【媒体文件数】{len(state.media_urls)}
-
-【图片/文件提取内容】
-{state.extracted_text[:3000] if state.extracted_text else '无'}
-
-【已累积的记忆片段（来自前几步 memory_search 工具）】
-{"\n".join(state.memory_context_parts) if state.memory_context_parts else '无'}
-
-【已累积的搜索上下文片段（来自前几步 web_search 工具）】
-{"\n\n".join(state.all_search_context_parts) if state.all_search_context_parts else '无'}
-
-请按你 system prompt 里规定的 JSON 格式输出本轮的单步编排决策。"""
-
-    max_retries = 2
+    # 【硬编码移除】max_retries=2 → EXPERT_ORCH_MAX_RETRIES
+    max_retries = EXPERT_ORCH_MAX_RETRIES
     # 第一次尝试用流式，后续重试改非流式（避免前端重复显示 analysis 文本）
     use_stream = True
     full_text = ""
@@ -1710,8 +1714,9 @@ C. 极其简单问题（纯问候、谢谢、再见、极短常识），直接�
                     {"role": "user", "content": user_prompt},
                 ],
                 stream=use_stream,
-                temperature=0.7,
-                max_tokens=3000,
+                # 【硬编码移除】temperature=0.7 / max_tokens=3000 → EXPERT_ORCH_*
+                temperature=EXPERT_ORCH_TEMPERATURE,
+                max_tokens=EXPERT_ORCH_MAX_TOKENS,
                 # 专家编排器输出 JSON，必须关思考：reasoning 会破坏 JSON 解析
                 **_chat_kwargs_with_thinking(disable_thinking=True),
             )
@@ -1755,11 +1760,8 @@ C. 极其简单问题（纯问候、谢谢、再见、极短常识），直接�
             except json.JSONDecodeError as je:
                 logger.warning(f"[专家模式][编排器] 第{attempt}次 JSON 解析失败: {je}, 内容={cleaned[:120]}")
                 if attempt < max_retries:
-                    user_prompt += (
-                        "\n\n【上次解析错误，请修正输出】"
-                        "\n强制要求：只输出纯 JSON，不要 ```json``` 代码块，不要任何解释文字。"
-                        "\n必须包含 action、analysis 字段。action=collect_tools 时还要有 step。"
-                    )
+                    # 【硬编码移除】原 L1825-L1829 内联 3 行 → EXPERT_ORCH_USER_RETRY_APPEND
+                    user_prompt += EXPERT_ORCH_USER_RETRY_APPEND
                     use_stream = False
                     continue
         except Exception as e:
@@ -1864,10 +1866,18 @@ async def _expert_final_deep_thinking(state: ExpertState) -> AsyncIterator[str]:
     FINAL: deep_thinking 流式路径（硬校验：最多调用一次）。
     每个 chunk 立即 yield 两条：type=thinking（前端黄色面板）和 type=content（最终正文）。
     深度思考输出 = 最终回复正文，不再二次润色。
+
+    【硬编码移除】
+      - state.final_path 字面量 → EXPERT_FINAL_PATH_DEEP
+      - system_prompt → DEEP_THINKING_SYSTEM_PROMPT
+      - thinking_start.message → DEEP_THINKING_START_MESSAGE
+      - temperature → DEEP_THINKING_TEMPERATURE
+      - reasoning_effort → DEEP_THINKING_REASONING_EFFORT
     """
     assert not state.deep_thinking_called, "深度思考重复调用（状态机硬校验失败）"
     state.deep_thinking_called = True
-    state.final_path = "deep_thinking"
+    # 【硬编码移除】"deep_thinking" → EXPERT_FINAL_PATH_DEEP
+    state.final_path = EXPERT_FINAL_PATH_DEEP
     logger.info("[专家模式][FINAL] 进入深度思考流式路径")
 
     if not deep_thinking_client:
@@ -1886,17 +1896,13 @@ async def _expert_final_deep_thinking(state: ExpertState) -> AsyncIterator[str]:
     for url in state.media_urls:
         user_content.append({"type": "image_url", "image_url": {"url": url}})
 
-    system_prompt = (
-        "你是深度思考模型。你的推理过程将直接作为最终回复的正文流式输出给用户。\n"
-        "【输出风格】先真实地一步步分析问题（分析问题、列事实、推理、对比、最后结论），"
-        "用自然语言写思考，不要刻意格式化成代码；适当分段、合理使用列表或加粗即可；"
-        "语气参考爱尔奎特·布伦史塔德的高贵傲慢（不用过度，只要不机械）。\n"
-        "【重要】你的推理过程 = 最终回复，不要在最后再说'上面是思考过程下面是答案'。"
-    )
+    # 【硬编码移除】深度思考 system_prompt → DEEP_THINKING_SYSTEM_PROMPT
+    system_prompt = DEEP_THINKING_SYSTEM_PROMPT
 
     # 思考开始提示块
+    # 【硬编码移除】"进入深度思考，正在逐步分析..." → DEEP_THINKING_START_MESSAGE
     yield _json_line({"type": "thinking_start", "data": {
-        "message": "进入深度思考，正在逐步分析..."
+        "message": DEEP_THINKING_START_MESSAGE
     }})
 
     chunk_count = 0
@@ -1908,9 +1914,11 @@ async def _expert_final_deep_thinking(state: ExpertState) -> AsyncIterator[str]:
                 {"role": "user", "content": user_content},
             ],
             stream=True,
-            temperature=0.3,
-            # 思考强度改为 low 提速：用户反馈深度思考太慢（之前默认 medium/high）
-            **_chat_kwargs_with_thinking(disable_thinking=False, reasoning_effort="low"),
+            # 【硬编码移除】temperature=0.3 → DEEP_THINKING_TEMPERATURE
+            temperature=DEEP_THINKING_TEMPERATURE,
+            # 【硬编码移除】reasoning_effort="low" → DEEP_THINKING_REASONING_EFFORT
+            **_chat_kwargs_with_thinking(disable_thinking=False,
+                                         reasoning_effort=DEEP_THINKING_REASONING_EFFORT),
         )
         logger.info("[深度思考] 流式连接建立 model=%s", EXPERT_DEEP_THINKING_MODEL)
         async for chunk in response:
@@ -1965,8 +1973,15 @@ async def _expert_final_reply_model(state: ExpertState) -> AsyncIterator[str]:
     FINAL: reply_directly 路径 —— 直接调用编排器模型（或回复模型）流式生成正文。
     简单问题专用（问候、极短常识），不经过深度思考。
     流式 chunk 到即 yield type=content，零等待。
+
+    【硬编码移除】
+      - state.final_path 字面量 → EXPERT_FINAL_PATH_REPLY
+      - system_prompt → REPLY_DIRECTLY_SYSTEM_PROMPT
+      - user_prompt → build_reply_directly_user_prompt
+      - temperature / max_tokens → REPLY_DIRECTLY_*
     """
-    state.final_path = "reply_directly"
+    # 【硬编码移除】"reply_directly" → EXPERT_FINAL_PATH_REPLY
+    state.final_path = EXPERT_FINAL_PATH_REPLY
     logger.info("[专家模式][FINAL] 进入简单回复模型流式路径")
 
     if not expert_orchestration_client:
@@ -1977,27 +1992,16 @@ async def _expert_final_reply_model(state: ExpertState) -> AsyncIterator[str]:
 
     start_time = time.time()
     global_context = _build_global_context(state)
-    history_text = ""
-    if state.history:
-        recent_history = state.history[-10:]
-        for msg in recent_history:
-            role = msg.get("role", "")
-            content = (msg.get("content") or "")[:500]
-            if role and content:
-                role_cn = "用户" if role == "user" else "助手"
-                history_text += f"\n{role_cn}：{content}"
+    # 【硬编码移除】[:500] / 最近10条 内联循环 → format_recent_history_for_llm
+    history_text = format_recent_history_for_llm(state.history)
 
-    system_prompt = (
-        "你是爱尔奎特·布伦史塔德，高贵的真祖，月之公主。\n"
-        "【角色】高贵、稍微有点傲慢但态度不恶劣；说话简洁、自然，不用复杂 markdown。\n"
-        "【任务】基于用户提问 + 给定上下文，直接生成简短自然的回复正文，"
-        "严格禁止输出'思考过程'标题或 JSON，直接输出对话正文即可。"
-    )
-    user_prompt = (
-        f"【用户提问】\n{state.message}\n\n"
-        f"【上下文】\n{global_context}\n\n"
-        f"【对话历史（最近10条）】\n{history_text if history_text else '无'}\n\n"
-        "请直接回复用户的问题，简短自然。"
+    # 【硬编码移除】原 L1992-L1997 内联 system prompt → REPLY_DIRECTLY_SYSTEM_PROMPT
+    system_prompt = REPLY_DIRECTLY_SYSTEM_PROMPT
+    # 【硬编码移除】原 L1998-L2003 内联 user prompt f-string → build_reply_directly_user_prompt
+    user_prompt = build_reply_directly_user_prompt(
+        user_message=state.message,
+        global_context=global_context,
+        history_text=history_text,
     )
 
     try:
@@ -2008,9 +2012,11 @@ async def _expert_final_reply_model(state: ExpertState) -> AsyncIterator[str]:
                 {"role": "user", "content": user_prompt},
             ],
             stream=True,
-            temperature=0.7,
-            max_tokens=2000,
+            # 【硬编码移除】temperature=0.7 / max_tokens=2000 → REPLY_DIRECTLY_*
+            temperature=REPLY_DIRECTLY_TEMPERATURE,
+            max_tokens=REPLY_DIRECTLY_MAX_TOKENS,
             # 用户要求：仅深度思考模型开思考；reply_directly（简单问题）属于快速回复路径，关思考
+            # reasoning_effort 这里保留 "low" 常量语义：config.behavior 未单独拆这一项（影响极小）
             **_chat_kwargs_with_thinking(disable_thinking=True, reasoning_effort="low"),
         )
         chunk_count = 0
@@ -2117,12 +2123,17 @@ async def update_backend_expert_trace(session_id: Optional[int], message_uuid: O
             "Content-Type": "application/json",
             "X-Internal-Secret": INTERNAL_SECRET,
         }
-        update_url = f"{BACKEND_BASE_URL}/api/message/update-content"
+        # 【硬编码移除】"/api/message/update-content" → BACKEND_ENDPOINT_UPDATE_MESSAGE_CONTENT
+        update_url = f"{BACKEND_BASE_URL}{BACKEND_ENDPOINT_UPDATE_MESSAGE_CONTENT}"
         logger.debug(
             "[专家模式][持久化] 复用现成 update-content 通路回写 expertTrace: url=%s, sessionId=%s, messageUuid=%s, payloadLen=%s",
             update_url, session_id, message_uuid, len(payload["expert_trace"]),
         )
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+        # 【硬编码移除】Timeout(10.0, connect=3.0) → BACKEND_INTERNAL_API_TIMEOUT + BACKEND_INTERNAL_API_CONNECT_TIMEOUT
+        async with httpx.AsyncClient(timeout=httpx.Timeout(
+            BACKEND_INTERNAL_API_TIMEOUT,
+            connect=BACKEND_INTERNAL_API_CONNECT_TIMEOUT,
+        )) as client:
             resp = await client.post(update_url, json=payload, headers=headers)
             # update-content 返回的 JSON: {code,message}；与 update-expert-trace 之前使用的"code==200且HTTP 200"保持一致
             ok = resp.status_code == 200
@@ -2315,17 +2326,20 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
                 continue
             elif orch.action == EXPERT_ACTION_DEEP:
                 state.phase = ExpertPhase.FINAL
-                state.final_path = "deep_thinking"
+                # 【硬编码移除】"deep_thinking" → EXPERT_FINAL_PATH_DEEP
+                state.final_path = EXPERT_FINAL_PATH_DEEP
                 break  # 跳出主循环到 FINAL
             elif orch.action == EXPERT_ACTION_REPLY:
                 state.phase = ExpertPhase.FINAL
-                state.final_path = "reply_directly"
+                # 【硬编码移除】"reply_directly" → EXPERT_FINAL_PATH_REPLY
+                state.final_path = EXPERT_FINAL_PATH_REPLY
                 break  # 跳出主循环到 FINAL
             else:
                 # 理论上 _parse_orch_result 已经兜底了，这里保险
                 logger.warning(f"[专家模式][硬校验] 未知 action={orch.action}，兜底 FINAL(deep)")
                 state.phase = ExpertPhase.FINAL
-                state.final_path = "deep_thinking"
+                # 【硬编码移除】"deep_thinking" → EXPERT_FINAL_PATH_DEEP
+                state.final_path = EXPERT_FINAL_PATH_DEEP
                 break
 
         # -------------------- EXECUTING：并行跑一组工具，立刻回到 DECIDING --------------------
@@ -2351,7 +2365,8 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
 
     # ========== 3. FINAL：两条流式路径之一 ==========
     logger.info(f"[专家模式] 进入 FINAL 阶段，final_path={state.final_path}")
-    if state.final_path == "deep_thinking":
+    # 【硬编码移除】字面量 "deep_thinking" → EXPERT_FINAL_PATH_DEEP
+    if state.final_path == EXPERT_FINAL_PATH_DEEP:
         async for line in _expert_final_deep_thinking(state):
             yield line
     else:
@@ -2418,6 +2433,15 @@ async def expert_mode_process(message: str, history: Optional[List[dict]], user_
 
 
 async def generate_summary(messages: Optional[List[dict]], existing_summary: Optional[str]):
+    """
+    对话摘要生成：把 messages（含 IMAGE/FILE 媒体类型、extractedText）拼接成 LLM 可读文本，
+    再走结构化摘要模型。输出 JSON：{key_points, entities, summary}。
+
+    【硬编码移除】
+      - 媒体消息的 prefix（图片/文件上传的 4 种标题行）→ HISTORY_IMAGE_* / HISTORY_FILE_*
+      - system_prompt / user_prompt → config.prompts.summarize SUMMARIZE_SYSTEM_PROMPT / build_summary_user_prompt
+      - temperature → SUMMARIZE_TEMPERATURE；关思考 → SUMMARIZE_DISABLE_THINKING
+    """
     logger.info(f"[摘要生成] 开始: 消息数量={len(messages) if messages else 0}, 已有摘要={'是' if existing_summary else '否'}")
 
     messages_text = ""
@@ -2427,37 +2451,32 @@ async def generate_summary(messages: Optional[List[dict]], existing_summary: Opt
             content = msg.get("content", "")
             msg_type = msg.get("messageType", "TEXT")
             extracted_text_history = msg.get("extractedText")
-            
+
+            # 【硬编码移除】4 段内联 f-string（"[用户上传了图片]..."）→ 统一走 config.prompts.context 常量
             if msg_type == "IMAGE":
                 if extracted_text_history:
-                    content = f"[用户上传了图片]\n提问：{content}\n图片内容：{extracted_text_history}"
+                    content = HISTORY_IMAGE_PREFIX_WITH_EXTRACTED.format(
+                        content=content, extracted_text=extracted_text_history
+                    )
                 else:
-                    content = f"[用户上传了图片]\n提问：{content}"
+                    content = HISTORY_IMAGE_PREFIX_SIMPLE.format(content=content)
             elif msg_type == "FILE":
                 if extracted_text_history:
-                    content = f"[用户上传了文件]\n提问：{content}\n文件内容：{extracted_text_history}"
+                    content = HISTORY_FILE_PREFIX_WITH_EXTRACTED.format(
+                        content=content, extracted_text=extracted_text_history
+                    )
                 else:
-                    content = f"[用户上传了文件]\n提问：{content}"
+                    content = HISTORY_FILE_PREFIX_SIMPLE.format(content=content)
             messages_text += f"{role}: {content}\n"
 
-    system_prompt = """你是一个专业的对话摘要助手。请根据对话内容生成结构化事实摘要。
+    # 【硬编码移除】原 L2458-L2465 大段 system prompt → SUMMARIZE_SYSTEM_PROMPT
+    system_prompt = SUMMARIZE_SYSTEM_PROMPT
 
-摘要要求：
-1. 长度不超过500个字符
-2. 使用JSON格式输出，包含以下字段：
-   - "key_points": 关键要点数组（3-5条）
-   - "entities": 涉及的实体/人物列表
-   - "summary": 简短的自然语言摘要（100字以内）"""
-
-    user_prompt = f"""请根据以下对话内容生成结构化事实摘要：
-
-{"--- 已有摘要 ---" if existing_summary else ""}
-{existing_summary if existing_summary else ""}
-
-{"--- 新增对话内容 ---" if messages_text else ""}
-{messages_text if messages_text else "无对话内容"}
-
-请输出符合要求的JSON格式摘要。"""
+    # 【硬编码移除】原 L2467-L2475 内联 user prompt f-string → build_summary_user_prompt
+    user_prompt = build_summary_user_prompt(
+        messages_text=messages_text,
+        existing_summary=existing_summary,
+    )
 
     try:
         response = await client.chat.completions.create(
@@ -2467,9 +2486,10 @@ async def generate_summary(messages: Optional[List[dict]], existing_summary: Opt
                 {"role": "user", "content": user_prompt}
             ],
             stream=False,
-            temperature=0.3,
+            # 【硬编码移除】temperature=0.3 → SUMMARIZE_TEMPERATURE
+            temperature=SUMMARIZE_TEMPERATURE,
             # 摘要生成输出 JSON，必须关思考：避免 reasoning 混入摘要文本
-            **_chat_kwargs_with_thinking(disable_thinking=True),
+            **_chat_kwargs_with_thinking(disable_thinking=SUMMARIZE_DISABLE_THINKING),
         )
 
         if response.choices and response.choices[0].message and response.choices[0].message.content:
