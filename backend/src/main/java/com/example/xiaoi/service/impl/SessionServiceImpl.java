@@ -54,8 +54,29 @@ public class SessionServiceImpl implements SessionService {
 
     private static final String REDIS_KEY_PREFIX = "session:";
     private static final String REDIS_TURN_COUNT_PREFIX = "session:turn:";
+    /** 会话被删除时在 Redis 立的墓碑 key 前缀：存在则说明会话已删除，所有写入应直接跳过 */
+    private static final String REDIS_DELETED_TOMBSTONE_PREFIX = "session:deleted:";
+    /** 墓碑 TTL：2 小时，远超流式 120s + 异步任务 60s，保证所有延迟写入都能覆盖 */
+    private static final long TOMBSTONE_TTL_SECONDS = 7200;
     private static final long REDIS_EXPIRE_DAYS = 1;
     private static final int MAX_REDIS_MESSAGES = 20;
+
+    /**
+     * 判断会话是否已被删除（通过 Redis 墓碑标记）。
+     * 用于所有写入口的前置拦截：命中墓碑说明 deleteSession 已经执行过，
+     * 直接跳过写入，防止产生孤儿脏数据（Redis / Qdrant 异步线程兜底清理）。
+     *
+     * @param sessionId 会话 ID
+     * @return true=会话已删除（应跳过写入），false=会话仍存活
+     */
+    private boolean isSessionDeleted(Long sessionId) {
+        if (sessionId == null) {
+            return true;
+        }
+        String tombstoneKey = REDIS_DELETED_TOMBSTONE_PREFIX + sessionId;
+        Boolean exists = redisTemplate.hasKey(tombstoneKey);
+        return Boolean.TRUE.equals(exists);
+    }
 
     // 摘要触发阈值：第 10 轮开始触发，之后每 5 轮触发一次
     private static final int SUMMARY_TRIGGER_THRESHOLD = 10;
@@ -183,13 +204,18 @@ public class SessionServiceImpl implements SessionService {
      */
     @Override
     public void saveMessage(Long sessionId, Map<String, Object> message, String messageType, String mediaUrl) {
+        // 【墓碑拦截】会话已被删除，直接跳过所有写入，防止孤儿脏数据
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-saveMessage] 会话已删除，跳过消息保存: sessionId={}", sessionId);
+            return;
+        }
         try {
             if (!message.containsKey("messageUuid")) {
                 message.put("messageUuid", java.util.UUID.randomUUID().toString());
             }
             String messageJson = objectMapper.writeValueAsString(message);
             String redisKey = REDIS_KEY_PREFIX + sessionId;
-            
+
             // Redis 写入（同步，毫秒级，不阻塞）
             redisTemplate.opsForList().rightPush(redisKey, messageJson);
             
@@ -221,6 +247,11 @@ public class SessionServiceImpl implements SessionService {
      */
     @Override
     public void savePlaceholderToRedis(Long sessionId, Map<String, Object> message) {
+        // 【墓碑拦截】会话已被删除，跳过占位消息写入，不重建孤儿 key
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-savePlaceholder] 会话已删除，跳过占位消息写入: sessionId={}", sessionId);
+            return;
+        }
         try {
             if (!message.containsKey("messageUuid")) {
                 message.put("messageUuid", java.util.UUID.randomUUID().toString());
@@ -244,6 +275,11 @@ public class SessionServiceImpl implements SessionService {
      * 轮次计数通过 Redis 同步递增（毫秒级），摘要提取通过异步服务执行
      */
     private void incrementTurnCount(Long sessionId) {
+        // 【墓碑拦截】会话已删除，不再递增轮次/触发摘要，不重建孤儿 Redis key
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-incrementTurnCount] 会话已删除，跳过轮次递增: sessionId={}", sessionId);
+            return;
+        }
         String turnKey = REDIS_TURN_COUNT_PREFIX + sessionId;
         Long turnCount = redisTemplate.opsForValue().increment(turnKey);
         
@@ -359,6 +395,12 @@ public class SessionServiceImpl implements SessionService {
 
     @Override
     public void updateMessageContent(Long sessionId, String messageUuid, String message, String extractedText, String expertTrace) {
+        // 【墓碑拦截】会话已删除，跳过回写，防止对孤儿 Redis key 和 MySQL 行做更新
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-updateMessageContent] 会话已删除，跳过回写: sessionId={}, messageUuid={}",
+                    sessionId, messageUuid);
+            return;
+        }
         // 统一多字段回写入口：复用现成 /api/message/update-content 通路（已在拦截器白名单，不会 401）。
         // 参数策略：哪个字段非空就更新消息 JSON 里的哪个字段；空(null/"") 不覆盖原值。
         //   - message:        用户提问正文（用户消息 JSON.content）
@@ -463,6 +505,12 @@ public class SessionServiceImpl implements SessionService {
 
     @Override
     public void updateMessageSearchResults(Long sessionId, String messageUuid, String searchResults) {
+        // 【墓碑拦截】会话已删除，跳过搜索结果回写，避免重建孤儿 Redis/MySQL 数据
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-updateMessageSearchResults] 会话已删除，跳过搜索结果回写: sessionId={}, messageUuid={}",
+                    sessionId, messageUuid);
+            return;
+        }
         // 搜索结果回写：每次搜索都会触发一次，降到 DEBUG；真正需要看的证据是 [聊天完成] replyLen/searchLen 汇总行
         // 搜索结果是 assistant 消息的字段（快速模式/专家模式共用），必须命中 role=assistant，避免被误写到用户消息里
         int srLen = searchResults != null ? searchResults.length() : 0;
@@ -523,6 +571,13 @@ public class SessionServiceImpl implements SessionService {
 
     @Override
     public boolean deleteSession(Long sessionId) {
+        // 【关键顺序】删除会话前必须先立墓碑，后续所有到达的写入（saveMessage / 异步回写等）都会命中墓碑直接跳过，
+        // 从源头拦截 99%+ 的孤儿脏数据产生（墓碑 TTL=2h，远超流式+异步最大耗时）。
+        // 必须先立墓碑再删业务数据，顺序不能反：否则在"删除key → 立墓碑"的缝隙内，写入可能绕过墓碑。
+        String tombstoneKey = REDIS_DELETED_TOMBSTONE_PREFIX + sessionId;
+        redisTemplate.opsForValue().set(tombstoneKey, "1", TOMBSTONE_TTL_SECONDS, java.util.concurrent.TimeUnit.SECONDS);
+        logger.debug("[立墓碑] 会话已标记为删除，有效期=2h: sessionId={}", sessionId);
+
         // 删除会话拆成：开始/汇总各 1 条 INFO；中间每一步（OSS/MySQL 两行/Redis/Qdrant/完成）全部降 DEBUG 或合并，
         // 避免一删会话就 7~8 行 INFO 刷屏。
         logger.info("开始删除会话: sessionId={}", sessionId);

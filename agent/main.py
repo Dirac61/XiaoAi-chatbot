@@ -2665,6 +2665,63 @@ async def delete_memory(request: DeleteMemoryRequest, request_obj: Request):
         raise HTTPException(status_code=500, detail=f"删除记忆失败: {str(e)}")
 
 
+# ============== 孤儿向量点清理内部接口（供后端定时调度器调用）==============
+class CleanupOrphansRequest(BaseModel):
+    """清理 Qdrant 孤儿向量点请求体"""
+    alive_session_ids: List[int] | List[str] | List = []
+    # 向后兼容：如果后端传的键名不同（比如驼峰）也接受；Python 侧读时取 alive_session_ids 即可
+
+
+@app.delete("/internal/memory/cleanup-orphans")
+async def internal_cleanup_memory_orphans(body: CleanupOrphansRequest, request_obj: Request):
+    """
+    【内部接口】定时孤儿清理的第4步（Qdrant层对齐）。
+    由后端 SessionCleanupScheduler 每 30 分钟调用一次，把当前所有存活会话 ID 传进来，
+    本接口在 Agent 端对 Qdrant 做 scroll，逐批删除 payload.sessionId 不在 alive_session_ids 中的孤儿点。
+
+    安全要求：必须携带 X-Internal-Secret 并与 env INTERNAL_SECRET 一致，否则 403。
+    """
+    # ---- 内部接口鉴权（与 /memory/delete 同一套密钥）----
+    header_secret = request_obj.headers.get("X-Internal-Secret", "")
+    if not INTERNAL_SECRET or not header_secret or not secrets.compare_digest(header_secret, INTERNAL_SECRET):
+        logger.warning("[Qdrant孤儿清理] 内部接口认证失败：密钥不匹配或为空")
+        raise HTTPException(status_code=403, detail="内部接口认证失败")
+
+    alive_ids = body.alive_session_ids or []
+    logger.info(f"[Qdrant孤儿清理] 收到请求：alive_session_ids 数量={len(alive_ids)}")
+
+    # memory_service.cleanup_orphan_points 内部是同步 Qdrant 调用，
+    # 放到线程池里跑，避免阻塞事件循环（scroll + 多次 delete 可能花几秒）
+    loop = asyncio.get_running_loop()
+
+    try:
+        deleted_count: int = await loop.run_in_executor(
+            None,
+            memory_service.cleanup_orphan_points,
+            alive_ids,
+        )
+    except Exception as e:
+        logger.error(f"[Qdrant孤儿清理] 执行异常: {e}")
+        raise HTTPException(status_code=500, detail=f"Qdrant孤儿清理失败: {str(e)}")
+
+    # 额外返回集合总点数信息，便于调度日志汇总
+    total_points_after = None
+    try:
+        if memory_service._initialized:
+            info = memory_service.qdrant_client.get_collection(QDRANT_COLLECTION)
+            total_points_after = info.points_count
+    except Exception as e:
+        logger.warning(f"[Qdrant孤儿清理] 读取集合统计失败: {e}")
+
+    response = {
+        "deleted_count": deleted_count,
+        "alive_ids_count": len(alive_ids),
+        "total_points_after": total_points_after,
+    }
+    logger.info(f"[Qdrant孤儿清理] 完成: {response}")
+    return response
+
+
 # ==============================================================================
 # MCP 插件市场：Agent 端 HTTP 接口（供后端 Spring 调用）
 # ==============================================================================

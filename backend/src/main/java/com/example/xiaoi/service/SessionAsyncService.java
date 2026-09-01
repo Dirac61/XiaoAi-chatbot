@@ -55,8 +55,27 @@ public class SessionAsyncService {
     private String internalSecret;
 
     private static final String REDIS_SUMMARY_PREFIX = "session:summary:";
+    /** 会话被删除时在 Redis 立的墓碑 key 前缀（与 SessionServiceImpl 保持一致） */
+    private static final String REDIS_DELETED_TOMBSTONE_PREFIX = "session:deleted:";
     private static final long REDIS_EXPIRE_DAYS = 1;
     private static final int MAX_SUMMARY_LENGTH = 500;
+
+    /**
+     * 判断会话是否已被删除（通过 Redis 墓碑标记）。
+     * 异步线程的入口双保险：因为异步任务是在 @Async 提交时就已经"脱离"了同步线程的墓碑判断，
+     * 在实际写入前再查一次墓碑，能覆盖"提交任务→会话被删→线程池调度执行"这种延迟窗口。
+     *
+     * @param sessionId 会话 ID
+     * @return true=会话已删除，应跳过本次异步写入
+     */
+    private boolean isSessionDeleted(Long sessionId) {
+        if (sessionId == null) {
+            return true;
+        }
+        String tombstoneKey = REDIS_DELETED_TOMBSTONE_PREFIX + sessionId;
+        Boolean exists = redisTemplate.hasKey(tombstoneKey);
+        return Boolean.TRUE.equals(exists);
+    }
 
     /**
      * 异步保存消息到 MySQL 并更新会话时间
@@ -68,6 +87,11 @@ public class SessionAsyncService {
      */
     @Async("summaryExecutor")
     public void asyncSaveMessageToDb(Long sessionId, String messageJson, String messageType, String mediaUrl) {
+        // 【墓碑双保险】异步线程实际执行前，再次确认会话未被删除；命中则不写孤儿 session_detail 行
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-asyncSaveMessageToDb] 会话已删除，跳过异步持久化: sessionId={}", sessionId);
+            return;
+        }
         try {
             SessionDetail sessionDetail = new SessionDetail();
             sessionDetail.setSessionId(sessionId);
@@ -97,6 +121,11 @@ public class SessionAsyncService {
      */
     @Async("summaryExecutor")
     public void asyncUpdateTurnCount(Long sessionId, Long turnCount) {
+        // 【墓碑双保险】异步线程执行前再次确认会话存活：会话删了递增轮次已无意义，还会 updateById 触碰被删会话的 update（虽然行已没了，但少一次 DB 访问）
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-asyncUpdateTurnCount] 会话已删除，跳过异步轮次递增: sessionId={}", sessionId);
+            return;
+        }
         try {
             // 用 setSql("turn_count = turn_count + 1") 实现数据库端原子递增
             // 不读取 MySQL 当前值再写入，避免并发问题或 Redis 脏数据覆盖
@@ -124,6 +153,11 @@ public class SessionAsyncService {
      */
     @Async("summaryExecutor")
     public void asyncExtractAndSaveSummary(Long sessionId, List<Map<String, Object>> messages) {
+        // 【墓碑双保险】会话已删除，再调 Agent 的 /summarize 接口是纯浪费（60s 阻塞 + 不会写回 DB）
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-asyncExtractAndSaveSummary] 会话已删除，跳过摘要提取: sessionId={}", sessionId);
+            return;
+        }
         try {
             String existingSummary = redisTemplate.opsForValue().get(REDIS_SUMMARY_PREFIX + sessionId);
 
@@ -185,6 +219,14 @@ public class SessionAsyncService {
      */
     @Async("summaryExecutor")
     public void asyncUpdateMessageContentToDb(Long sessionId, String messageUuid, String updatedJson) {
+        // 【墓碑双保险】最关键：此处存在"找不到匹配行自动 INSERT"的 upsert 逻辑，
+        // 一旦会话被删除且 detail 表先被清空，这里会插入一行孤儿 session_detail（session_id 指向不存在的会话）。
+        // 入口查墓碑，从源头阻止这种孤儿行产生。
+        if (isSessionDeleted(sessionId)) {
+            logger.warn("[墓碑命中-asyncUpdateMessageContentToDb] 会话已删除，跳过异步回写: sessionId={}, messageUuid={}",
+                    sessionId, messageUuid);
+            return;
+        }
         try {
             LambdaQueryWrapper<SessionDetail> queryWrapper = new LambdaQueryWrapper<>();
             queryWrapper.eq(SessionDetail::getSessionId, sessionId);

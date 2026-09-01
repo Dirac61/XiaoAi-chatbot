@@ -409,6 +409,30 @@ class MemoryService:
         self.redis_client.expire(redis_key, 30 * 24 * 3600)
         logger.debug(f"📝 标记已存储: point_id={point_id[:20]}..., session_id={session_id}, result={result}")
 
+    def _is_session_deleted_tombstone(self, session_id: str) -> bool:
+        """
+        【墓碑机制-可选】通过 Redis 墓碑 key 判断会话是否已被删除。
+        这是对后端 SessionServiceImpl 所立墓碑的"读端同步判断"，用于记忆写入前的二次拦截：
+        一旦流结束后异步触发记忆提取时会话已被用户删除，就跳过向量 upsert，
+        减少 Qdrant 孤儿向量点产生（定时清理仍会兜底，但这里能少写就少写）。
+        :param session_id: 会话ID（字符串或数字都行，内部会 str 统一）
+        :return: True=会话已删除，应跳过写入；False=会话存活或 Redis 未连接（保守放行）
+        """
+        if not session_id:
+            return False
+        if not self.redis_client:
+            # Redis 未连接时无法判断，保守放行（后续定时孤儿清理兜底）
+            return False
+        tombstone_key = f"session:deleted:{session_id}"
+        try:
+            exists = self.redis_client.exists(tombstone_key) > 0
+            if exists:
+                logger.info(f"[墓碑命中-store_memory] 会话已被后端标记删除，跳过记忆写入: session_id={session_id}")
+            return exists
+        except Exception as e:
+            logger.warning(f"[墓碑] Redis 墓碑查询异常(将保守放行): session_id={session_id}, 错误={e}")
+            return False
+
     async def _is_duplicate_vector(self, content: str, dense_vector: List[float], session_id: str, threshold: float = 0.85) -> bool:
         """
         第二层去重：检查向量库中是否存在相似记忆（向量相似度去重）
@@ -466,6 +490,7 @@ class MemoryService:
         points = []
         skipped_literal = 0
         skipped_vector = 0
+        skipped_tombstone = 0
         failed_embedding = 0
         
         for idx, unit in enumerate(memory_units):
@@ -476,6 +501,11 @@ class MemoryService:
 
             user_id = unit.get("userId", 0)
             session_id = unit.get("sessionId", 0)
+
+            # 【墓碑可选拦截】会话已被后端删除时不做后续去重/嵌入/写入
+            if self._is_session_deleted_tombstone(str(session_id)):
+                skipped_tombstone += 1
+                continue
             
             point_id = self._generate_stable_point_id(content, user_id)
             
@@ -526,11 +556,11 @@ class MemoryService:
                 collection_info = self.qdrant_client.get_collection(QDRANT_COLLECTION)
                 logger.info(f"✅ 成功存储 {len(points)} 个记忆点到Qdrant")
                 logger.info(f"📊 存储统计: dense_dim={self.embedding_dim}, bm25_keywords={len(bm25_scores) if points else 0}, total_points={collection_info.points_count}")
-                logger.info(f"📊 去重统计: 字面去重跳过={skipped_literal}, 向量去重跳过={skipped_vector}, 嵌入失败={failed_embedding}")
+                logger.info(f"📊 去重统计: 墓碑跳过={skipped_tombstone}, 字面去重跳过={skipped_literal}, 向量去重跳过={skipped_vector}, 嵌入失败={failed_embedding}")
             except Exception as e:
                 logger.error(f"❌ 存储记忆失败: {e}")
         else:
-            logger.warning(f"📥 处理后没有有效的记忆点需要存储(字面去重={skipped_literal}, 向量去重={skipped_vector}, 嵌入失败={failed_embedding})")
+            logger.warning(f"📥 处理后没有有效的记忆点需要存储(墓碑跳过={skipped_tombstone}, 字面去重={skipped_literal}, 向量去重={skipped_vector}, 嵌入失败={failed_embedding})")
 
     async def search_memories(self, query: str, session_id: str, top_k: int = None) -> List[Dict[str, Any]]:
         """
@@ -720,6 +750,106 @@ class MemoryService:
                 await self.store_memory(memory_units)
         except Exception as e:
             logger.error(f"异步记忆提取和存储失败: {e}")
+
+    def cleanup_orphan_points(self, alive_session_ids: List) -> int:
+        """
+        【定时孤儿清理-Qdrant层】清理会话已被删除但向量点还残留的孤儿记忆点。
+
+        执行流程：
+          1. 将 alive_session_ids 转成 Set[str] 方便 O(1) 差集判断（注意 Qdrant payload 的 sessionId 都是字符串）
+          2. 使用 qdrant_client.scroll 增量迭代整个 collection（不 fetch vectors，只带 payload 省网络）
+          3. 每批点：若 point.payload.sessionId 不在 alive_ids_set 内，就是孤儿点，收集 point.id
+          4. 孤儿点累积到 ORPHAN_DELETE_BATCH(500) 个就执行一次 delete，避免一次请求过大
+          5. scroll 完后，把不足一批的尾巴再 flush 一次 delete
+
+        :param alive_session_ids: 存活会话 ID 列表（元素可以是 int/str，内部统一转 str）
+        :return: 实际删除的 Qdrant 向量点总数
+        """
+        if not self._initialized:
+            self.init()
+        client = self.qdrant_client
+
+        # alive_ids_set：统一为字符串（与 payload 里的 sessionId 类型严格匹配，避免 int/str 比较永远 False）
+        alive_ids_set: set = set()
+        for sid in alive_session_ids or []:
+            if sid is None:
+                continue
+            alive_ids_set.add(str(sid))
+
+        total_deleted = 0
+        orphan_ids: List[Any] = []
+        # 一批累积到 500 个就执行删除（Qdrant gRPC/HTTP 单包体积安全阈值）
+        ORPHAN_DELETE_BATCH = 500
+
+        logger.info(f"[Qdrant孤儿清理] 开始：存活会话数={len(alive_ids_set)}, scroll collection={QDRANT_COLLECTION}")
+
+        def _flush_orphans() -> int:
+            """内部函数：把 orphan_ids 累积的孤儿点执行一次 delete，返回本次删除数"""
+            nonlocal orphan_ids
+            if not orphan_ids:
+                return 0
+            batch = orphan_ids
+            orphan_ids = []
+            try:
+                result = client.delete(
+                    collection_name=QDRANT_COLLECTION,
+                    points_selector=models.PointIdsList(points=batch),
+                )
+                # qdrant_client 不同版本返回结构有差异，安全兼容多种写法
+                cnt = 0
+                if hasattr(result, "count") and isinstance(result.count, int):
+                    cnt = result.count
+                elif hasattr(result, "status"):
+                    # 新版 API 可能返回 operation_id，用 len(batch) 近似
+                    cnt = len(batch)
+                else:
+                    cnt = len(batch)
+                logger.info(f"[Qdrant孤儿清理] 批量删除孤儿点 {len(batch)}/{cnt} 个")
+                return cnt
+            except Exception as e:
+                logger.error(f"[Qdrant孤儿清理] 批量删除失败: batch_size={len(batch)}, 错误={e}")
+                return 0
+
+        try:
+            offset = None
+            scroll_batch_size = 500
+            # scroll 迭代（order_by=None / with_payload=True / with_vectors=False）
+            while True:
+                records, next_offset = client.scroll(
+                    collection_name=QDRANT_COLLECTION,
+                    limit=scroll_batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if not records:
+                    break
+                for rec in records:
+                    payload = rec.payload or {}
+                    sid = payload.get("sessionId")
+                    if sid is None:
+                        # 没有 sessionId 的点也视为孤儿（不合法数据）
+                        orphan_ids.append(rec.id)
+                        continue
+                    sid_str = str(sid)
+                    if sid_str not in alive_ids_set:
+                        orphan_ids.append(rec.id)
+                # 累积够一批就 flush
+                if len(orphan_ids) >= ORPHAN_DELETE_BATCH:
+                    total_deleted += _flush_orphans()
+                # scroll 终止条件：next_offset 为 None/空
+                if next_offset is None:
+                    break
+                offset = next_offset
+            # flush 尾批
+            total_deleted += _flush_orphans()
+            logger.info(f"[Qdrant孤儿清理] 完成：总删除点数={total_deleted}, 存活会话数={len(alive_ids_set)}")
+            return total_deleted
+        except Exception as e:
+            # 出异常前也尽量 flush 已收集的孤儿点，避免下一次重算
+            tail_cnt = _flush_orphans()
+            logger.error(f"[Qdrant孤儿清理] scroll异常: 已累计删除={total_deleted + tail_cnt}, 错误={e}")
+            return total_deleted + tail_cnt
 
 
 memory_service = MemoryService()
