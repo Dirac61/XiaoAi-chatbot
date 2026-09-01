@@ -1,3 +1,10 @@
+# 本地依赖目录：受限环境装不进 site-packages 时，pip install --target ./.deps 装到此目录
+# 启动时自动注入 sys.path，让 tushare 等可选依赖可被导入（目录不存在则跳过，零副作用）
+import sys, os
+_LOCAL_DEPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deps")
+if os.path.isdir(_LOCAL_DEPS) and _LOCAL_DEPS not in sys.path:
+    sys.path.insert(0, _LOCAL_DEPS)
+
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -168,11 +175,19 @@ from config.tools import (
     default_tool_description_lines,
 )
 
+# MCP 插件市场模块
+from mcp.registry import mcp_registry
+from mcp.client_pool import mcp_client_pool
+from mcp.tool_registry import mcp_tool_registry
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("初始化MemoryService...")
     memory_service.init()
+    # 加载 MCP 市场元数据
+    logger.info("初始化MCP市场...")
+    await mcp_registry.load()
     yield
 
 
@@ -407,6 +422,8 @@ class ExpertState:
     search_results_flattened: List[dict] = field(default_factory=list)
     all_search_context_parts: List[str] = field(default_factory=list)
     memory_context_parts: List[str] = field(default_factory=list)
+    # MCP 插件工具调用结果上下文（供 FINAL 阶段 deep_thinking / reply_model 使用）
+    mcp_context_parts: List[str] = field(default_factory=list)
 
     # 持久化数据：编排历史（analysis）+ 工具执行历史（原始结果不摘要）
     orch_history: List[OrchHistoryRecord] = field(default_factory=list)
@@ -659,7 +676,7 @@ def _build_global_context(state: ExpertState) -> str:
         memory_context_parts=state.memory_context_parts,
         search_context_parts=state.all_search_context_parts,
         extracted_max_len=MEDIA_EXTRACTED_MAX_LEN,
-    )
+    ) + ("\n\n" + "\n".join(state.mcp_context_parts) if state.mcp_context_parts else "")
 
 
 class ChatRequest(BaseModel):
@@ -1675,7 +1692,10 @@ async def _expert_call_orchestrator_stream(
 
     # 可用工具清单（动态注入，编排器 system prompt 里显式告知）
     # 【硬编码移除】原 for 循环里 web_search / memory_search 的 if/elif 分支 → default_tool_description_lines()
-    tools_desc_lines = default_tool_description_lines(EXPERT_TOOL_REGISTRY)
+    # MCP 扩展：先懒加载用户已装 MCP 安装记录，再动态获取工具列表（内置 + MCP）
+    if state.user_id:
+        await mcp_client_pool.load_user_installed(state.user_id)
+    tools_desc_lines = mcp_tool_registry.get_tool_lines(state.user_id or 0)
 
     # 【硬编码移除】system_prompt / user_prompt → config.prompts.orchestrator_expert.build_*
     system_prompt = build_expert_orch_system_prompt(
@@ -1787,9 +1807,11 @@ def _parse_orch_result(obj: dict, raw_output: str) -> OrchResult:
         if isinstance(step_obj, dict) and step_obj.get("tools"):
             tools: List[ToolCall] = []
             for t in step_obj.get("tools", []):
-                if isinstance(t, dict) and t.get("tool") and t.get("tool") in EXPERT_TOOL_REGISTRY:
+                # 工具校验：内置工具在 EXPERT_TOOL_REGISTRY，MCP 工具用命名空间前缀（tushare__xxx）走 is_mcp_tool 判断
+                tool_name = t.get("tool") if isinstance(t, dict) else None
+                if tool_name and (tool_name in EXPERT_TOOL_REGISTRY or mcp_tool_registry.is_mcp_tool(tool_name)):
                     tools.append(ToolCall(
-                        tool=t["tool"],
+                        tool=tool_name,
                         params=dict(t.get("params") or {}),
                     ))
                 else:
@@ -1812,6 +1834,84 @@ def _parse_orch_result(obj: dict, raw_output: str) -> OrchResult:
 # 专家模式：EXECUTING 阶段（step.tools[] 并行工具执行）
 # ==============================================================================
 
+async def _invoke_mcp_tool(tool_name: str, params: Dict[str, Any], state: ExpertState) -> Tuple[ToolExecutionRecord, List[str]]:
+    """MCP 工具调用包装器：走 McpToolRegistry → McpClientPool 路由到对应 MCP 实例。
+    与 _tool_web_search 接口完全一致：返回 (ToolExecutionRecord, stream_chunks)。
+    """
+    import time as _time
+    start = _time.time()
+    stream_chunks: List[str] = []
+    error: Optional[str] = None
+
+    # 发送 tool_call_start（统一工具调用协议，前端据此渲染工具步骤）
+    stream_chunks.append(json.dumps({
+        "type": "tool_call_start",
+        "data": {"tool": tool_name, "params": params},
+    }, ensure_ascii=False))
+    logger.debug(f"[专家模式][工具:MCP] 开始调用 {tool_name}, params={params}")
+
+    try:
+        result = await mcp_tool_registry.execute(state.user_id or 0, tool_name, params)
+        summary = result.get("summary", "")
+        data = result.get("data", [])
+        context_text = result.get("context_text", "")
+        duration_ms = result.get("duration_ms", 0)
+
+        # 累积 MCP 结果到全局 state（供 FINAL 阶段 deep_thinking / reply_model 使用）
+        if context_text:
+            state.mcp_context_parts.append(context_text)
+
+        logger.debug(f"[MCP][工具完成] {tool_name}: {summary}, 耗时={duration_ms}ms")
+
+        # 发送 tool_call_result（统一工具调用协议）
+        stream_chunks.append(json.dumps({
+            "type": "tool_call_result",
+            "data": {
+                "tool": tool_name,
+                "success": True,
+                "durationMs": duration_ms,
+                "resultCount": len(data),
+                "summary": summary,
+                "results": data[:20],  # 限制返回数量，避免前端渲染过多
+            },
+        }, ensure_ascii=False))
+
+        record = ToolExecutionRecord(
+            tool=tool_name,
+            params=params,
+            success=True,
+            durationMs=duration_ms,
+            resultCount=len(data),
+            error=None,
+            rawResult=data[:20],
+        )
+    except Exception as e:
+        error = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"[专家模式][工具:MCP] {tool_name} 调用失败: {error}")
+        stream_chunks.append(json.dumps({
+            "type": "tool_call_result",
+            "data": {
+                "tool": tool_name,
+                "success": False,
+                "durationMs": 0,
+                "resultCount": 0,
+                "summary": "调用失败",
+                "error": error,
+            },
+        }, ensure_ascii=False))
+        record = ToolExecutionRecord(
+            tool=tool_name,
+            params=params,
+            success=False,
+            durationMs=int((_time.time() - start) * 1000),
+            resultCount=None,
+            error=error,
+            rawResult=None,
+        )
+
+    return record, stream_chunks
+
+
 async def _expert_execute_step(state: ExpertState, step: PlanStep) -> Tuple[List[ToolExecutionRecord], List[str]]:
     """
     执行单步计划中的一组并行工具：
@@ -1822,6 +1922,10 @@ async def _expert_execute_step(state: ExpertState, step: PlanStep) -> Tuple[List
     logger.info(f"[专家模式][EXECUTING] 本步 purpose={step.purpose}, 工具数={len(step.tools)}")
     coros: List[Awaitable[Tuple[ToolExecutionRecord, List[str]]]] = []
     for tc in step.tools:
+        # MCP 工具路由：工具名含 "__" 前缀（如 tushare__stock_summary）
+        if mcp_tool_registry.is_mcp_tool(tc.tool):
+            coros.append(_invoke_mcp_tool(tc.tool, tc.params, state))
+            continue
         if tc.tool not in EXPERT_TOOL_REGISTRY:
             # 未知工具：构造失败记录，不抛异常，保证编排器下轮能感知
             now_ms = 0
@@ -2559,6 +2663,63 @@ async def delete_memory(request: DeleteMemoryRequest, request_obj: Request):
     except Exception as e:
         logger.error(f"[内存删除] 失败: sessionId={request.session_id}, 错误={str(e)}")
         raise HTTPException(status_code=500, detail=f"删除记忆失败: {str(e)}")
+
+
+# ==============================================================================
+# MCP 插件市场：Agent 端 HTTP 接口（供后端 Spring 调用）
+# ==============================================================================
+
+class McpInstallRequest(BaseModel):
+    """MCP 安装请求体"""
+    user_id: int
+    mcp_id: str
+    env_values: Dict[str, str] = {}
+
+
+@app.get("/mcp/market")
+async def mcp_market_list(category: str = None, keyword: str = None):
+    """MCP 市场列表（供后端代理调用）"""
+    return {"data": mcp_registry.list_all(category=category, keyword=keyword)}
+
+
+@app.get("/mcp/market/{mcp_id}")
+async def mcp_market_detail(mcp_id: str):
+    """MCP 单个详情（供后端代理调用）"""
+    detail = mcp_registry.get_detail(mcp_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"MCP {mcp_id} 不存在")
+    return {"data": detail}
+
+
+@app.post("/mcp/install")
+async def mcp_install(request: McpInstallRequest):
+    """安装 MCP：写堆内存映射（不启动实例，懒加载）
+    后端 Spring 调用此接口让 Agent 建立堆内存映射，
+    返回 fingerprint + env_encrypted 供后端存 MySQL。
+    """
+    result = await mcp_client_pool.install(request.user_id, request.mcp_id, request.env_values)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message", "安装失败"))
+    logger.info(f"[MCP API] 安装成功: user={request.user_id}, mcp={request.mcp_id}")
+    return result
+
+
+@app.post("/mcp/uninstall")
+async def mcp_uninstall(request: McpInstallRequest):
+    """卸载 MCP：删堆内存映射 + 关闭实例（引用归零时）"""
+    await mcp_client_pool.uninstall(request.user_id, request.mcp_id)
+    logger.info(f"[MCP API] 卸载成功: user={request.user_id}, mcp={request.mcp_id}")
+    return {"success": True}
+
+
+@app.post("/mcp/update-env")
+async def mcp_update_env(request: McpInstallRequest):
+    """修改 Token：更新指纹 + 关闭旧实例（下次调用时懒启动新实例）"""
+    result = await mcp_client_pool.update_env(request.user_id, request.mcp_id, request.env_values)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message", "更新失败"))
+    logger.info(f"[MCP API] 更新Token成功: user={request.user_id}, mcp={request.mcp_id}")
+    return result
 
 
 if __name__ == "__main__":

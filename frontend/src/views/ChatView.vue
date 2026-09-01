@@ -1051,6 +1051,11 @@ const processAudio = async (audioBlob) => {
               <span>专家模式</span>
             </button>
           </div>
+          <!-- 插件市场入口：跳转 /market 浏览/安装 MCP 插件 -->
+          <button class="market-btn magent" data-ripple="true" @click="router.push('/market')" title="插件市场：浏览并安装 MCP 插件">
+            <span class="market-btn__icon">📦</span>
+            <span>插件市场</span>
+          </button>
           <span class="username">{{ currentUser }}</span>
           <button class="logout-btn magent" data-ripple="true" @click="handleLogout">退出登录</button>
         </div>
@@ -1535,6 +1540,33 @@ const processAudio = async (audioBlob) => {
   border-color: var(--line-crimson);
   color: var(--crimson-100);
   transform: translateY(-1px);
+}
+
+/* 插件市场入口：月光紫细边框胶囊，hover 透出月光感 */
+.market-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: 1px solid var(--line-glow);
+  color: var(--moonlight-100);
+  padding: 8px 16px;
+  border-radius: 999px;
+  font-size: 13px;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all var(--dur-base) var(--ease-out-expo);
+}
+.market-btn__icon {
+  font-size: 14px;
+  line-height: 1;
+}
+.market-btn:hover {
+  background: rgba(139, 124, 255, 0.14);
+  border-color: var(--moonlight-300);
+  color: #fff;
+  transform: translateY(-1px);
+  box-shadow: 0 8px 22px -10px rgba(139, 124, 255, 0.55);
 }
 
 /* ---------- 3. 模式切换（快速 / 专家）：「月相双相」切换 ---------- */

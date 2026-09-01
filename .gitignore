@@ -15,6 +15,7 @@ agent/__pycache__/
 *.py[cod]
 *.pyo
 agent/.env
+agent/.deps/
 
 # Node / Vue
 frontend/node_modules/

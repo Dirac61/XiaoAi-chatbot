@@ -31,6 +31,7 @@ public class InterceptorConfig implements WebMvcConfigurer {
      * - /api/message/update-search-results  : Agent 回写联网搜索结果[{title,url}]
      * - /api/message/update-expert-trace    : Agent 回写专家模式编排分析+工具执行结果expertTrace
      * - /api/memory/delete                  : Agent 删除会话向量记忆（会话删除联动）
+     * - /api/mcp/internal/installed          : Agent 查询用户已安装 MCP 列表（懒加载用）
      * - /api/session/delete/**              : 用户侧正常删除会话，走 Token 校验+此处仅排除（不需要 X-Internal-Secret）
      */
     @Override
@@ -41,7 +42,8 @@ public class InterceptorConfig implements WebMvcConfigurer {
                 .excludePathPatterns("/api/login", "/api/health",
                     "/api/message/update-content", "/api/message/update-search-results",
                     "/api/message/update-expert-trace",
-                    "/api/memory/delete", "/api/session/delete/**");
+                    "/api/memory/delete", "/api/session/delete/**",
+                    "/api/mcp/internal/installed");
 
         // InternalApiInterceptor: 内部接口密钥认证拦截器（仅 Agent → 后端的回写接口）
         // 注意：只注册"需要 X-Internal-Secret 鉴权"的真正内部接口（不含 /api/session/delete/**）
@@ -50,7 +52,8 @@ public class InterceptorConfig implements WebMvcConfigurer {
                     "/api/message/update-content",
                     "/api/message/update-search-results",
                     "/api/message/update-expert-trace",
-                    "/api/memory/delete"
+                    "/api/memory/delete",
+                    "/api/mcp/internal/installed"
                 );
     }
 }

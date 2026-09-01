@@ -1,0 +1,95 @@
+{
+  "version": "1.0",
+  "updated_at": "2026-08-31",
+  "mcps": [
+    {
+      "mcp_id": "tushare",
+      "name": "TuShare 股票数据",
+      "version": "1.0.0",
+      "author": "TuShare",
+      "category": "finance",
+      "description": "A股/基金/指数 实时行情 + 财务报表 + 涨跌停数据 + 每日指标",
+      "icon": "📈",
+      "homepage": "https://tushare.pro",
+      "risk_level": "low",
+      "transport": {
+        "type": "builtin_sdk",
+        "package": "tushare",
+        "env_template": [
+          {
+            "key": "TUSHARE_TOKEN",
+            "label": "TuShare Token",
+            "required": true,
+            "type": "password",
+            "help": "在 tushare.pro 注册免费获取"
+          }
+        ]
+      },
+      "tools": [
+        {
+          "name": "stock_summary",
+          "description": "A股股票综合快照（行情+估值+财务指标；股票代码 6 位数字，6 开头上证 .SH、0/3 开头深证 .SZ，如 600519.SH/000001.SZ），适合查'某只股票现在怎么样'",
+          "params_template": "{ \"ts_code\": \"股票代码 6 位+后缀，如 600519.SH 或 000001.SZ\" }"
+        },
+        {
+          "name": "stock_daily",
+          "description": "A股股票日线行情（开高低收+涨跌幅+成交量；股票代码 6 位 .SH/.SZ），适合查'股票最近走势'",
+          "params_template": "{ \"ts_code\": \"股票代码 .SH/.SZ\", \"start_date\": \"YYYYMMDD\", \"end_date\": \"YYYYMMDD\" }"
+        },
+        {
+          "name": "stock_financial",
+          "description": "A股股票三表财报关键指标（营收/净利润/ROE/每股收益；股票代码 6 位 .SH/.SZ），适合查'股票财务怎么样'",
+          "params_template": "{ \"ts_code\": \"股票代码 .SH/.SZ\", \"periods\": 4 }"
+        },
+        {
+          "name": "fund_summary",
+          "description": "公募基金综合快照（基金名称+类型+管理人+规模+最新净值；基金代码 6 位数字 .OF 后缀，如 024418.OF），适合查'某只基金现在怎么样'。用户给纯数字 6 位代码且不是股票代码时优先用此工具",
+          "params_template": "{ \"ts_code\": \"基金代码 6 位+.OF，如 024418.OF\" }"
+        },
+        {
+          "name": "fund_daily",
+          "description": "公募基金日线净值历史（单位净值+累计净值；基金代码 .OF），适合查'基金最近走势'",
+          "params_template": "{ \"ts_code\": \"基金代码 .OF\", \"start_date\": \"YYYYMMDD\", \"end_date\": \"YYYYMMDD\" }"
+        }
+      ]
+    },
+    {
+      "mcp_id": "akshare",
+      "name": "AKShare 股票基金数据",
+      "version": "1.0.0",
+      "author": "AKShare",
+      "category": "finance",
+      "description": "A股/基金/港股/美股 实时行情 + 历史数据 + 基金净值，完全免费无需 Token",
+      "icon": "📊",
+      "homepage": "https://akshare.akfamily.xyz",
+      "risk_level": "low",
+      "transport": {
+        "type": "builtin_sdk",
+        "package": "akshare",
+        "env_template": []
+      },
+      "tools": [
+        {
+          "name": "stock_summary",
+          "description": "A股股票综合快照（名称+总市值+行业+最新行情；股票代码 6 位纯数字，6 开头上证如 600519、0/3 开头深证如 000001，不带后缀），适合查'某只股票现在怎么样'",
+          "params_template": "{ \"symbol\": \"股票代码 6 位纯数字，如 600519 或 000001\" }"
+        },
+        {
+          "name": "stock_daily",
+          "description": "A股股票日线行情历史（开高低收+涨跌幅+成交量；股票代码 6 位纯数字），适合查'股票最近走势'",
+          "params_template": "{ \"symbol\": \"股票代码 6 位纯数字\", \"start_date\": \"YYYYMMDD\", \"end_date\": \"YYYYMMDD\" }"
+        },
+        {
+          "name": "fund_summary",
+          "description": "公募基金综合快照（基金名称+类型+管理人+规模+最新净值；基金代码 6 位纯数字如 024418/000001，不带后缀），适合查'某只基金现在怎么样'。用户给纯数字 6 位代码且不是股票代码时优先用此工具",
+          "params_template": "{ \"symbol\": \"基金代码 6 位纯数字，如 024418\" }"
+        },
+        {
+          "name": "fund_daily",
+          "description": "公募基金净值历史（单位净值+累计净值；基金代码 6 位纯数字），适合查'基金最近走势'",
+          "params_template": "{ \"symbol\": \"基金代码 6 位纯数字\", \"start_date\": \"YYYYMMDD\", \"end_date\": \"YYYYMMDD\" }"
+        }
+      ]
+    }
+  ]
+}
