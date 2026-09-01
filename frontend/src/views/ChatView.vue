@@ -1095,7 +1095,8 @@ const processAudio = async (audioBlob) => {
         <div class="chat-messages" ref="chatContainer" @scroll="handleScroll">
           <div v-for="(msg, index) in messages" :key="index"
                :class="['message', msg.type, { 'msg-streaming': msg.type === 'bot' && index === messages.length - 1 && isLoading }]">
-            <div class="message-bubble tilt" :data-role="msg.type">
+            <!-- 移除 tilt class：删除消息气泡跟随鼠标 3D 微倾斜晃动效果，仅保留气泡基础样式 -->
+            <div class="message-bubble" :data-role="msg.type">
               <div v-if="msg.type === 'system'" class="system-message">
                 {{ msg.content }}
               </div>
